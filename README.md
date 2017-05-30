@@ -1,8 +1,8 @@
 # BAT - Bisulfite Analyss Toolkit
-(website)[http://www.bioinf.uni-leipzig.de/Software/BAT/]
+
+[WEBSITE](http://www.bioinf.uni-leipzig.de/Software/BAT/)
 
 ## Introduction
--------
 
 Cytosine DNA methylation is a biochemical process that has been shown
 to play an important roll in gene expression and cell
@@ -24,7 +24,6 @@ modules of BAT.
 
 
 ## Modules
--------
 [**Mapping**](http://www.bioinf.uni-leipzig.de/Software/BAT/mapping)
 
 The first module comprises read mapping including pre- and
@@ -37,7 +36,7 @@ The second module covers the extraction of methylation information from
 the alignments, filtering for positions of interest, e.g. CG context, 
 and conversion of methylation information for visualisation.
 
-[**Analysis**](http://www.bioinf.uni-leipzig.de/Software/BAT/analysis
+[**Analysis**](http://www.bioinf.uni-leipzig.de/Software/BAT/analysis)
 
 In the third module basic analysis of two groups of a single sample or 
 up to multiple samples are performed.
@@ -48,8 +47,7 @@ Finally, the calling of DMRs is coverd by the fourth module. Basic statistics
 of the DMRs are provided and given expression information of genes, correlating 
 DMRs can be calculated.
 
-Example data
-------------
+## Example data
 
 The example data comprise the raw reads of one sample and the already
 called, but not filtered reads of that sample and further 7
@@ -63,23 +61,4 @@ genome, some gene annotations and gene expression data are
 provided. This will enable you, to run the entire toolkit on a
 small example region.
 
-In a quite basic version, the tool calls are shown at the [example
-page](http://www.bioinf.uni-leipzig.de/Software/BAT/example). There, the tool calls are given, all output 
-files are stated and, if plots are produced, they are presented.
-
-A [run-script](http://www.bioinf.uni-leipzig.de/Software/BAT/scripts/v0.1/run_example.sh),
-running all analysis shown on the example page and the input data can
-be downloaded [here](http://www.bioinf.uni-leipzig.de/Software/BAT/BAT_example_input.tar.gz) (for futher information see 
-[example page](http://www.bioinf.uni-leipzig.de/Software/BAT/example). As the run-script refers to a recommended folder 
-structure, the input data including the folder structure can also be 
-downloaded [here](http://www.bioinf.uni-leipzig.de/Software/BAT/BAT_example_structure.tar.gz) (985 MB).
-
-In addition, all BAT scripts can be downloaded one by one [here](http://www.bioinf.uni-leipzig.de/Software/BAT/scripts/v0.1).
-
-Docker
-------------
-If you prefer to not install all [dependencies](http://www.bioinf.uni-leipzig.de/Software/BAT/install), you can use the [BAT docker image](http://www.bioinf.uni-leipzig.de/Software/BAT/install.md/#docker). 
-Dependencies and scripts are installed - simply pull the image. To test it, download 
-the input data including the folder structure [here](http://www.bioinf.uni-leipzig.de/Software/BAT/BAT_example_structure.tar.gz) 
-(985 MB), run the docker image and the run-script. For a quick start, have a look 
-[here](install.md/#docker)
+For more information please got to the [website](http://www.bioinf.uni-leipzig.de/Software/BAT).
