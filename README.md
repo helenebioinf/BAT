@@ -61,4 +61,4 @@ genome, some gene annotations and gene expression data are
 provided. This will enable you, to run the entire toolkit on a
 small example region.
 
-For more information please got to the [website](http://www.bioinf.uni-leipzig.de/Software/BAT).
+For more information please go to the [website](http://www.bioinf.uni-leipzig.de/Software/BAT).
