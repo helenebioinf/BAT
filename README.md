@@ -130,13 +130,14 @@ small example region.
 
 
 ## Obtaining
+
 To download the BAT scripts, please use git to download the most recent development tree. Currently, the tree is hosted on github, and can be obtained via:
 
 git clone https://github.com/helenebioinf/BAT
 
 
 ## Docker
-------------
+
 If you prefer to not install all [dependencies](http://www.bioinf.uni-leipzig.de/Software/BAT/install), you can use the [BAT docker image](http://www.bioinf.uni-leipzig.de/Software/BAT/install.md/#docker). 
 Dependencies and scripts are installed - simply pull the image. To test it, download 
 the input data including the folder structure [here](http://www.bioinf.uni-leipzig.de/Software/BAT/BAT_example_structure.tar.gz) 
@@ -146,3 +147,7 @@ the input data including the folder structure [here](http://www.bioinf.uni-leipz
 
 ## Detailed Information
 For more information please go to the [website](http://www.bioinf.uni-leipzig.de/Software/BAT).
+
+## Contact
+
+Please report any issues or questions to helene [at] bioinf [dot] uni-leipzig.de
