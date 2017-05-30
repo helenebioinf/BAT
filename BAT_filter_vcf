@@ -1,0 +1,617 @@
+#!/usr/bin/env perl
+
+use strict;
+use warnings;
+
+use Getopt::Long;
+use File::Spec;
+use List::Util qw/sum min max/;
+use File::Temp qw/tempfile tempdir/;
+use File::Basename;
+
+# -----------------------------------------------------------------------------
+# Variables
+
+my ($USAGE, $OUT, $call, $ret, $help, $vcf, $out, $pdf, $bedgraph, $context, $MDP_min, $MDP_max, $MR_min, $MR_max, $MR, $R, $flag, @label, $labels, $gzip, $zcat);
+my ($chrom_pos, $pos_pos, $info_pos, $format_pos, @sample_pos, @names);
+my ($CCpos, $MMRpos, $DMRpos, $MDPpos, $MRpos, @CCs);
+my (@all_rate, @all_cov, @filter_rate, @filter_cov);
+my $SCRIPTNAME = basename($0);
+my $VERSION    = "v0.1";
+
+# -----------------------------------------------------------------------------
+# OPTIONS
+
+$USAGE = << "USE";
+
+    usage:  perl $SCRIPTNAME --vcf <string> --out <string> [--context <string>] [--MDP_min <number>] [--MDP_max <number>] [--NS <number>] [--MR_min <number>] [--MR_max <number>] [--MR] [-R <string>]
+
+    [INPUT]     --vcf       path/filename of gezipped vcf file containing methylation calling information
+                --out       path/filename of filtered outfiles (gezipped vcf file, bedgraph, pdf)
+                --context   comma seperated list of context
+                --MDP_min   minimum number of reads after filtering by bisulfite conversion strand in all samples
+                --MDP_max   maximum number of reads after filtering by bisulfite conversion strand in all samples
+                --MR_min    Minimum sample methylation rate
+                --MR_max    Maximum sample methylation rate
+                --MR        flag, if MR filter should be applied only to mean methylation/difference in methylation rate
+                -R          path/filename of R (default: in PATH)
+USE
+
+if (!@ARGV) {
+    printf STDERR $USAGE;
+    exit -1;
+}
+
+unless (GetOptions(
+    "vcf=s"     => \$vcf,
+    "out=s"     => \$out,
+    "context=s" => \$context,
+    "MDP_min=s" => \$MDP_min,
+    "MDP_max=s" => \$MDP_max,
+    "MR_min=s"  => \$MR_min,
+    "MR_max=s"  => \$MR_max,
+    "MR"        => \$MR,
+    "R=s"       => \$R,
+    "h|help"    => \$help
+)){
+    printf STDERR $USAGE;
+    exit -1;
+}
+if (defined $help){
+    printf STDERR $USAGE;
+    exit -1;
+}
+
+# -----------------------------------------------------------------------------
+# MAIN
+## script name and version
+print STDERR ("[INFO]" . prettyTime() . "$SCRIPTNAME $VERSION started\n");
+
+my $cur_dir             = File::Spec->curdir();
+my ($vol, $dir, $name)  = File::Spec->splitpath($vcf);
+
+if (defined $vcf){
+    $vcf        = File::Spec->rel2abs($vcf);
+    $bedgraph   = $vcf;
+    $bedgraph   =~ s/.vcf.gz$/.bedgraph/;
+    $name =~ s/.vcf.gz$/.pdf/;
+    $pdf  = File::Spec->catpath($vol, $cur_dir, $name);
+
+}
+if (defined $out){
+    $out        = File::Spec->rel2abs($out);
+    if ($out !~ m/.vcf.gz$/) {
+        $out = ($out . ".vcf.gz")
+    }
+    $bedgraph   = $out;
+    $bedgraph   =~ s/.vcf.gz$/.bedgraph/;
+    $pdf        = $out;
+    $pdf        =~ s/.vcf.gz$/.pdf/;
+}
+else {
+    printf STDERR $USAGE;
+    die "##### AN ERROR has occurred: required option --out missing\n";
+}
+
+
+############
+## checks ##
+############
+print STDERR ("[INFO]" . prettyTime() . "Checking flags\n");
+
+if (defined $R){$R = File::Spec->rel2abs($R);}
+
+
+if ((defined $vcf) && (-e $vcf)){
+    unless (-r $vcf){
+        die "##### AN ERROR has occurred: $vcf (option --vcf) not readable\n";
+    }
+}
+else{
+    printf STDERR $USAGE;
+    die "##### AN ERROR has occurred: required option --vcf missing or nonexistent\n";
+}
+
+## R executable ##
+if (defined $R){
+    if (-e $R){
+        unless (-d $R){
+            unless (-x $R){
+                die "##### AN ERROR has occurred: --R option executable is not executable\n";
+            }
+        }
+        else{
+            die "##### AN ERROR has occurred: --R option executable is directory\n";
+        }
+    }
+    else{
+        die "##### AN ERROR has occurred: --R option executable nonexistent\n";
+    }
+}
+else{
+    $R = "R";
+}
+$call   = "command -v $R >/dev/null 2>&1";
+$ret    = system ($call);
+if ($ret != 0){
+    die "##### AN ERROR has occurred: No R executable (R) found. Please provide path/filename of R executable with -R option\n";
+}
+
+if ((defined $context) || (defined $MDP_min) || (defined $MDP_max) || (defined $MR_min) || (defined $MR_max)) {
+    $flag = 1;
+    open(OUT, "| gzip -c >$out") or die "##### AN ERROR has occurred: $out could not be openend\n";
+    
+    if (!defined $out){
+        die "##### AN ERROR has occurred: required option --out missing\n";
+    }
+    
+    if (defined $context){
+        @CCs = split(/,/, $context);
+    }
+    
+    my $j = 0;
+    if (defined $context) {
+        $label[$j] = ("context:" . $context);
+        $j++;
+    }
+    if (defined $MDP_min) {
+        $label[$j] = ("min MDP:" . $MDP_min);
+        $j++;
+    }
+    if (defined $MDP_max) {
+        $label[$j] = ("max MDP:" . $MDP_max);
+        $j++;
+    }
+    if (defined $MR_min) {
+        $label[$j] = ("min MR:" . $MR_min);
+        if (defined $MR) {
+            $label[$j] = (" (all)");
+        }
+        $j++;
+    }
+    if (defined $MR_max) {
+        $label[$j] = ("max MDP:" . $MR_max);
+        if (defined $MR) {
+            $label[$j] = (" (all)");
+        }
+        $j++;
+    }
+    $labels = join(", ", @label);
+}
+else{
+    $labels = $vcf;
+    $labels =~ s/.vcf.gz//;
+    $flag = 0;
+    
+}
+
+print STDERR ("[INFO]" . prettyTime() . "Checking input file\n");
+open (IN, "zcat $vcf 2> /dev/null | ") || die "cannot open $vcf\n";
+while (<IN>) {
+    if (($_ =~ m/^#/) && ($flag != 0)) {
+        print OUT $_;
+    }
+    chomp;
+    
+    if ($_ !~ m/^##/ && $_ =~ m/^#/){
+        $_ =~ s/^#//;
+        
+        my @tags = split(/\t/,$_);
+        my $i    = 0;
+        foreach my $t (@tags){
+            if ($t eq "CHROM") {
+                $chrom_pos = $i;
+            }
+            elsif ($t eq "POS"){
+                $pos_pos = $i;
+            }
+            elsif ($t eq "INFO"){
+                $info_pos = $i;
+            }
+            elsif ($t eq "FORMAT"){
+                $format_pos = $i;
+            }
+            elsif ($t ne "ID" && $t ne "REF" && $t ne "ALT" && $t ne "QUAL" && $t ne "FILTER"){
+                push(@names, $t);
+                push(@sample_pos, $i);
+            }
+            $i++;
+        }
+        if (scalar(@names)>1) {
+            push(@names, "average");
+        }
+        
+        if ((!defined $chrom_pos) || (!defined $pos_pos) || (!defined $info_pos) || (!defined $format_pos)){
+            die "No proper vcf format - may have used an old caller version? Need to contain at least following columns: CHROM, POS, INFO, FORMAT, sample!\n";
+        }
+    }
+    elsif ($_ !~ m/^#/) {
+        ## get flag information
+        my ($chrom, $pos, $info, $format)   = (split(/\t/, $_))[$chrom_pos,$pos_pos,$info_pos,$format_pos];
+        my @samples                         = (split(/\t/, $_))[@sample_pos];
+        my @info_items                      = split(/;/, $info);
+        my @format_items                    = split(/:/, $format);
+        
+        for (my $i=0; $i<scalar(@info_items); $i++){
+            my $tag = $info_items[$i];
+            if ($tag =~ m/^CC=/){
+                $CCpos = $i;           #context
+            }
+            elsif ($tag =~ m/^MMR=/){
+                $MMRpos = $i;           #mean methylation rate
+            }
+            elsif ($tag =~ m/^DMR=/){
+                $DMRpos = $i;           #difference in methylation rates
+            }
+        }
+        if ((!defined $CCpos) || (!defined $MMRpos) || (!defined $DMRpos)){
+            die "No proper vcf format - may have used an old caller version? INFO column need to contain CC or NS or MMR or DMR flag!\n";
+        }
+        
+        for (my $i=0; $i<scalar(@format_items); $i++){
+            my $tag = $format_items[$i];
+            if ($tag eq "MDP"){
+                $MDPpos = $i;          #conversion specific converage
+            }
+            elsif ($tag eq "MR"){
+                $MRpos = $i;           #methylation rate
+            }
+        }
+        if ((!defined $MDPpos) || (!defined $MRpos)){
+            die "No proper vcf format - may have used an old caller version? FORMAT column need to contain MDP and MR flag!\n";
+        }
+        
+        last;
+    }
+}
+close (IN);
+
+##############
+## read vcf ##
+##############
+print STDERR ("[INFO]" . prettyTime() . "Reading input $vcf\n");
+
+open(OUT_B, ">$bedgraph") or die "##### AN ERROR has occurred: could not write to $bedgraph\n";
+
+if ($flag == 0) {
+    open (IN, "zcat $vcf |") || die "cannot open $vcf\n";
+    
+    while (<IN>) {
+        chomp;
+        
+        if ($_ !~ m/#/){
+            my ($chrom, $pos, $info, $sample)   = (split(/\t/,$_))[$chrom_pos, $pos_pos, $info_pos];
+            my @samples                         = (split(/\t/, $_))[@sample_pos];
+            my ($cc, $mmr, $dmr)           = (split(/;/,$info))[$CCpos, $MMRpos, $DMRpos];
+            my $start = ($pos-1);
+            $cc  =~ s/^CC=//;
+            $mmr =~ s/^MMR=//;
+            $dmr =~ s/^DMR=//;
+            
+            my $r = $mmr;
+            if ($dmr ne ".") {
+                $r = $dmr;
+            }
+            
+            my @co;
+            my @co_mean;
+            my @ra;
+            foreach my $s (@samples){
+                my $tc = (split(/:/, $s))[$MDPpos];
+                my $tr = (split(/:/, $s))[$MRpos];
+                if (($tc ne "NA") && ($tr ne "NA")) {
+                    push(@co_mean, $tc);
+                }
+                push(@co, $tc);
+                push(@ra, $tr);
+            }
+            
+            if (scalar(@names)>1) {
+                # count mean/diff rate
+                if (exists $all_rate[scalar(@ra)]{$r}) {
+                    $all_rate[scalar(@ra)]{$r}++;
+                }
+                else {
+                    $all_rate[scalar(@ra)]{$r} = 1;
+                }
+                
+                # count mean coverage
+                my $m = sum(@co_mean)/@co_mean;
+                if (exists $all_cov[scalar(@co)]{$m}) {
+                    $all_cov[scalar(@co)]{$m}++;
+                }
+                else {
+                    $all_cov[scalar(@co)]{$m} = 1;
+                }
+            }
+            
+            # count sample's coverages
+            for (my $i=0; $i<scalar(@co); $i++){
+                if ($co[$i] ne "NA") {
+                    if (exists $all_cov[$i]{$co[$i]}) {
+                        $all_cov[$i]{$co[$i]}++;
+                    }
+                    else {
+                        $all_cov[$i]{$co[$i]} = 1;
+                    }
+                }
+            }
+            
+            # count sample's rates
+            for (my $i=0; $i<scalar(@ra); $i++){
+                if ($ra[$i] ne "NA") {
+                    if (exists $all_rate[$i]{$ra[$i]}) {
+                        $all_rate[$i]{$ra[$i]}++;
+                    }
+                    else {
+                        $all_rate[$i]{$ra[$i]} = 1;
+                    }
+                }
+            }
+            print OUT_B "$chrom\t$start\t$pos\t$r\n";
+        }
+    }
+}
+else {
+    open (IN, "zcat $vcf | ") || die "cannot open $vcf\n";
+    while (<IN>) {
+        chomp;
+        
+        if ($_ !~ m/#/){
+            my ($chrom, $pos, $info, $sample)   = (split(/\t/,$_))[$chrom_pos, $pos_pos, $info_pos];
+            my @samples                         = (split(/\t/, $_))[@sample_pos];
+            my ($cc, $mmr, $dmr)           = (split(/;/,$info))[$CCpos, $MMRpos, $DMRpos];
+            my $start = ($pos-1);
+            $cc  =~ s/^CC=//;
+            $mmr =~ s/^MMR=//;
+            $dmr =~ s/^DMR=//;
+            
+            my $r = $mmr;
+            if ($dmr ne ".") {
+                $r = $dmr;
+            }
+            
+            my @co;
+            my @co_mean;
+            my @ra;
+            foreach my $s (@samples){
+                my $tc = (split(/:/, $s))[$MDPpos];
+                my $tr = (split(/:/, $s))[$MRpos];
+                if (($tc ne "NA") && ($tr ne "NA")) {
+                    push(@co_mean, $tc);
+                }
+                push(@co, $tc);
+                push(@ra, $tr);
+            }
+            
+            ## all positions
+            if (scalar(@names)>1) {
+                # count mean/diff rate
+                if (exists $all_rate[scalar(@ra)]{$r}) {
+                    $all_rate[scalar(@ra)]{$r}++;
+                }
+                else {
+                    $all_rate[scalar(@ra)]{$r} = 1;
+                }
+                
+                # count mean coverage
+                ####remove NAs bevor calc mean
+                my $ma = sum(@co_mean)/@co_mean;
+                if (exists $all_cov[scalar(@co)]{$ma}) {
+                    $all_cov[scalar(@co)]{$ma}++;
+                }
+                else {
+                    $all_cov[scalar(@co)]{$ma} = 1;
+                }
+            }
+            
+            # count sample's coverages
+            for (my $i=0; $i<scalar(@co); $i++){
+                if ($co[$i] ne "NA") {
+                    if (exists $all_cov[$i]{$co[$i]}) {
+                        $all_cov[$i]{$co[$i]}++;
+                    }
+                    else {
+                        $all_cov[$i]{$co[$i]} = 1;
+                    }
+                }
+            }
+            
+            # count sample's rates
+            for (my $i=0; $i<scalar(@ra); $i++){
+                if ($ra[$i] ne "NA") {
+                    if (exists $all_rate[$i]{$ra[$i]}) {
+                        $all_rate[$i]{$ra[$i]}++;
+                    }
+                    else {
+                        $all_rate[$i]{$ra[$i]} = 1;
+                    }
+                }
+            }
+            
+            #filter positions
+            if (defined $context) {
+                if (!grep /$cc/, @CCs){
+                    next;
+                }
+            }
+            if ((defined $MR_min) || (defined $MR_max)) {
+                if (defined $MR) {
+                    if ((defined $MR_min) && ($r < $MR_min)) {
+                        next;
+                    }
+                    if ((defined $MR_max) && ($r > $MR_max)) {
+                        next;
+                    }
+                }
+                else {
+                    if ((defined $MR_min) && (min(@ra) < $MR_min)) {
+                        next;
+                    }
+                    if ((defined $MR_max) && (max(@ra) > $MR_max)) {
+                        next;
+                    }
+                }
+            }
+            if ((defined $MDP_min) || (defined $MDP_max)) {                
+                if ((defined $MDP_min) && (min(@co)<$MDP_min)) {
+                    next;
+                }
+                if ((defined $MDP_max) && (max(@co)>$MDP_max)) {
+                    next;
+                }
+            }            
+            
+            @co = ();
+            @ra = ();
+            foreach my $s (@samples){
+                my $tc = (split(/:/, $s))[$MDPpos];
+                my $tr = (split(/:/, $s))[$MRpos];
+                #if (($tc ne "NA") && ($tr ne "NA")) {
+                    push(@co, $tc);
+                    push(@ra, $tr);
+                #}
+            }
+
+            ## filtered positions
+            if (scalar(@names)>1) {
+                # count mean/diff rate
+                if (exists $filter_rate[scalar(@ra)]{$r}) {
+                    $filter_rate[scalar(@ra)]{$r}++;
+                }
+                else {
+                    $filter_rate[scalar(@ra)]{$r} = 1;
+                }
+                
+                # count mean coverage
+                ####remove NAs bevor calc mean
+                my $mf = sum(@co)/@co;
+                if (exists $filter_cov[scalar(@co)]{$mf}) {
+                    $filter_cov[scalar(@co)]{$mf}++;
+                }
+                else {
+                    $filter_cov[scalar(@co)]{$mf} = 1;
+                }
+            }
+            
+            # count sample's coverages
+            for (my $i=0; $i<scalar(@co); $i++){
+                if ($co[$i] ne "NA") {
+                    if (exists $filter_cov[$i]{$co[$i]}) {
+                        $filter_cov[$i]{$co[$i]}++;
+                    }
+                    else {
+                        $filter_cov[$i]{$co[$i]} = 1;
+                    }
+                }
+            }
+            
+            # count sample's rates
+            for (my $i=0; $i<scalar(@ra); $i++){
+                if ($ra[$i] ne "NA") {
+                    if (exists $filter_rate[$i]{$ra[$i]}) {
+                        $filter_rate[$i]{$ra[$i]}++;
+                    }
+                    else {
+                        $filter_rate[$i]{$ra[$i]} = 1;
+                    }
+                }
+            }
+            
+            print OUT "$_\n";
+            print OUT_B "$chrom\t$start\t$pos\t$r\n";
+            
+        }
+    }
+    close (IN);
+    close (OUT);
+}
+close (OUT_B);
+
+
+################
+## statistics ##
+################
+print STDERR ("[INFO]" . prettyTime() . "Plot statistics to $pdf\n");
+my $tmp_file = $pdf;
+$tmp_file =~ s/.pdf/.counts/;
+
+open(OUT_tmp, ">$tmp_file") or die "##### AN ERROR has occurred: could not write to $tmp_file\n";
+print OUT_tmp "x\ttype\tsample\tvalue\tfreq\n";
+for (my $i=0; $i<=scalar(@names); $i++){
+    for my $tmp (keys %{$all_cov[$i]}) {
+        print OUT_tmp "cov\tall\t$names[$i]\t$tmp\t$all_cov[$i]{$tmp}\n";
+    }
+    for my $tmp (keys %{$filter_cov[$i]}) {
+        print OUT_tmp "cov\tfilter\t$names[$i]\t$tmp\t$filter_cov[$i]{$tmp}\n";
+    }
+    for my $tmp (keys %{$all_rate[$i]}) {
+        print OUT_tmp "rate\tall\t$names[$i]\t$tmp\t$all_rate[$i]{$tmp}\n";
+    }
+    for my $tmp (keys %{$filter_rate[$i]}) {
+        print OUT_tmp "rate\tfilter\t$names[$i]\t$tmp\t$filter_rate[$i]{$tmp}\n";
+    }
+}
+close (OUT_tmp);
+
+my $plot =
+    "args <- commandArgs(trailingOnly = TRUE)
+    options(warn=-1)
+    suppressPackageStartupMessages(library('ggplot2'))
+    data <- read.table('$tmp_file', header=T, colClasses=c('factor','factor','factor','numeric','numeric'))
+    w <- 7*length(levels(data\\\$sample))
+    
+    pdf('$pdf', width=w)
+    if (nrow(data[data\\\$x=='rate' & data\\\$type=='all',])>0){
+        if (min(data[data\\\$x=='rate' & data\\\$type=='all',]\\\$value)<0){
+            suppressMessages(ggplot(data[data\\\$x=='rate' & data\\\$type=='all',], aes(x=value, y=freq)) + geom_bar(stat='identity', fill='#009e73') + facet_wrap(~sample) + theme_bw(14) + theme(text=element_text(family='Helvetica'), panel.grid.major=element_blank(), panel.background=element_blank(), axis.line=element_line(colour='black')) + xlab('rate') + ylab('frequency') + ggtitle('methylation rates at all positions'))
+        }else{
+            suppressMessages(ggplot(data[data\\\$x=='rate' & data\\\$type=='all',], aes(x=value, y=freq)) + geom_bar(stat='identity', fill='#009e73') + facet_wrap(~sample) + theme_bw(14) + theme(text=element_text(family='Helvetica'), panel.grid.major=element_blank(), panel.background=element_blank(), axis.line=element_line(colour='black')) + xlab('rate') + ylab('frequency') + ggtitle('methylation rates at all positions') + scale_x_continuous(limits=c(-0.01,1.01)))
+        }
+    }
+    if (nrow(data[data\\\$x=='rate' & data\\\$type=='filter',])>0){
+        if (min(data[data\\\$x=='rate' & data\\\$type=='all',]\\\$value)<0){
+            suppressMessages(ggplot(data[data\\\$x=='rate' & data\\\$type=='filter',], aes(x=value, y=freq)) + geom_bar(stat='identity', fill='#009e73') + facet_wrap(~sample) + theme_bw(14) + theme(text=element_text(family='Helvetica'), panel.grid.major=element_blank(), panel.background=element_blank(), axis.line=element_line(colour='black')) + xlab('rate') + ylab('frequency') + ggtitle('methylation rates at filtered positions\n$labels'))
+        }else{
+            suppressMessages(ggplot(data[data\\\$x=='rate' & data\\\$type=='filter',], aes(x=value, y=freq)) + geom_bar(stat='identity', fill='#009e73') + facet_wrap(~sample) + theme_bw(14) + theme(text=element_text(family='Helvetica'), panel.grid.major=element_blank(), panel.background=element_blank(), axis.line=element_line(colour='black')) + xlab('rate') + ylab('frequency') + ggtitle('methylation rates at filtered positions\n$labels') + scale_x_continuous(limits=c(-0.01,1.01)))
+        }
+    }
+    if (nrow(data[data\\\$x=='cov' & data\\\$type=='all',])>0){
+        suppressMessages(ggplot(data[data\\\$x=='cov' & data\\\$type=='all',], aes(x=value, y=freq)) + geom_bar(stat='identity', fill='#009e73') + facet_wrap(~sample) + theme_bw(14) + theme(text=element_text(family='Helvetica'), panel.grid.major=element_blank(), panel.background=element_blank(), axis.line=element_line(colour='black')) + xlab('coverage') + ylab('frequency') + ggtitle('coverages at all positions') + scale_x_continuous(limits=c(-0.01,1+max(data[data\\\$x=='cov' & data\\\$type=='all',4]))))
+    }
+    if (nrow(data[data\\\$x=='cov' & data\\\$type=='all',])>0){
+        suppressMessages(ggplot(data[data\\\$x=='cov' & data\\\$type=='all',], aes(x=value, y=freq)) + geom_bar(stat='identity', fill='#009e73') + facet_wrap(~sample) + theme_bw(14) + theme(text=element_text(family='Helvetica'), panel.grid.major=element_blank(), panel.background=element_blank(), axis.line=element_line(colour='black')) + xlab('coverage') + ylab('frequency') + ggtitle(paste0('coverages at all positions,  in 1-', quantile(rep(data[data\\\$x=='cov' & data\\\$type=='all',]\\\$value, data[data\\\$x=='cov' & data\\\$type=='all',]\\\$freq), seq(0,1,0.01))[100], ' (90%-quantile)')) + scale_x_continuous(limits=c(-0.01, quantile(rep(data[data\\\$x=='cov' & data\\\$type=='all',]\\\$value, data[data\\\$x=='cov' & data\\\$type=='all',]\\\$freq), seq(0,1,0.01))[100])))
+    }
+    if (nrow(data[data\\\$x=='cov' & data\\\$type=='filter',])>0){
+        suppressMessages(ggplot(data[data\\\$x=='cov' & data\\\$type=='filter',], aes(x=value, y=freq)) + geom_bar(stat='identity', fill='#009e73') + facet_wrap(~sample) + theme_bw(14) + theme(text=element_text(family='Helvetica'), panel.grid.major=element_blank(), panel.background=element_blank(), axis.line=element_line(colour='black')) + xlab('coverage') + ylab('frequency') + ggtitle('coverages at filtered positions\n$labels') + scale_x_continuous(limits=c(-0.01,1+max(data[data\\\$x=='cov' & data\\\$type=='filter',4]))))
+    }
+    dev.off()
+    ";
+
+`echo "$plot" | $R --slave --silent`;
+
+$call = "rm $tmp_file";
+call($call);
+
+
+
+# -----------------------------------------------------------------------------
+# FUNCTIONS
+
+sub call{
+    my ($sub_call) = @_;
+        
+    $ret = system ($sub_call);
+    
+    if ($ret != 0){
+        die "##### AN ERROR has occurred\n";
+    }
+}
+
+sub prettyTime{
+    my @months      = qw(Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec);
+    my @weekDays    = qw(Sun Mon Tue Wed Thu Fri Sat Sun);
+    my ($second, $minute, $hour, $dayOfMonth, $month, $yearOffset, $dayOfWeek, $dayOfYear, $daylightSavings) = localtime();
+    my $year        = 1900 + $yearOffset;
+    return "\t$weekDays[$dayOfWeek] $months[$month] $dayOfMonth, $hour:$minute:$second, $year\t";
+}

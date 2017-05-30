@@ -1,0 +1,443 @@
+#!/usr/bin/env perl
+
+use strict;
+use warnings;
+
+use File::Basename;
+use Getopt::Long;
+use File::Spec;
+use File::Path qw(make_path);
+use File::Temp qw/ tempfile tempdir /;
+
+# -----------------------------------------------------------------------------
+# Variables
+
+my ($USAGE, $call, $help, $prov, $ret, $bed, $expr, $methyl, $groups, $bwAvgOverBed, $min, $group_id, $R, $latex, $dvipdf);
+my ($EXPR, $expr_file, $METHYL, $methyl_file, $out);
+my (@sample, @sample_group, @group_ids);
+my $SCRIPTNAME = basename($0);
+my $VERSION    = "v0.1";
+
+# -----------------------------------------------------------------------------
+# OPTIONS
+
+$USAGE = << "USE";
+
+    usage:  perl $SCRIPTNAME -b <string> -e <string> -m <string> -i <string> -g <string> -o <string> [--min <number>] [--bw <string>] [--prov] [--latex <string>] [--dvipdf <string>] [-R <string>] 
+
+    [INPUT]     -b          bedfile containing coordinates of regions for methylation rate and name of associated gene identifier
+			    (link of methylation rate per region and gene expression)
+			    (format: chr<tab>start<tab>end<tab>identifier), identifier need to match gene identifier
+                -e          file containing list of expression files (format: identifier<tab>add_value<tab>expression_value). add_value in column 2 is not used -> value is irrelevant.
+                -m          file containing list of methylation bigwig files
+		-g	    file containing list of group membership and identifier (order w/r/t to order in expression and methylation files)
+			    (format: sample_label<tab>group)
+		-i	    comma-separated identifiers of the two groups, (default g1,g2). Groups need to match groups in -g file.
+                
+    [GENERAL]   -o          path/prefix for output (path for correlation plots and path/prefix.txt for statistics)
+                --min       minimum number of bases covered by bigwig file in gene region to calculate correlation (default: 5)
+                --bw        path/filename of UCSCtools bigWigAverageOverBed executable (default in PATH)
+		-R	    path/filename of R executable (default in PATH)
+		--prov	    flag, if -e and -m already contain methylation (format: sample.id<tab>group<tab>chr:start-stopp<tab>gene.identifer<tab>methylation.rate) and expression values
+			    (format: sample.id<tab>group<tab>gene.identifer<tab>expression.value). Only -e, -m, -i, and -g are required.
+		--latex	    path/filename of latex executable (default in PATH)
+		--dvipdf    path/filename of dvipdf executable (default in PATH)
+USE
+
+unless (GetOptions(
+    "b=s"   => \$bed,
+    "e=s"   => \$expr,
+    "m=s"   => \$methyl,
+    "g=s"   => \$groups,
+    "o=s"   => \$out,
+    "min=s" => \$min,
+    "bw=s"  => \$bwAvgOverBed,
+    "i=s"   => \$group_id,
+    "prov"  => \$prov,
+    "R=s"   => \$R,
+    "latex=s" => \$latex,
+    "dvipdf=s"=> \$dvipdf,
+    "h|help"=> \$help
+)){
+    printf STDERR $USAGE;
+    exit -1;
+}
+if (defined $help){
+    printf STDERR $USAGE;
+    exit -1;
+}
+
+# -----------------------------------------------------------------------------
+# MAIN
+## script name and version
+print STDERR ("[INFO]" . prettyTime() . "$SCRIPTNAME $VERSION started\n");
+
+############
+## checks ##
+############
+print STDERR ("[INFO]" . prettyTime() . "Checking input\n");
+
+if ((!defined $expr) || (!defined $methyl) || (!defined $out)) {
+    print "##### AN ERROR has occurred: -e or -m option missing\n";
+    printf STDERR $USAGE;
+    exit -1;
+}
+$out = File::Spec->rel2abs($out);
+my ($vol, $directory, $file) = File::Spec->splitpath($out);
+if (!-d $directory) {
+    $ret = make_path($directory);
+    if ($ret != 1){
+        die "##### AN ERROR has occurred: could not make directory $directory\n";
+    }
+}
+
+if (!defined $prov) {
+    if (!defined $bed) {
+	print "##### AN ERROR has occurred: -b option missing\n";
+	printf STDERR $USAGE;
+	exit -1;
+    }
+
+  if (defined $bwAvgOverBed){
+    $bwAvgOverBed = File::Spec->rel2abs($bwAvgOverBed);
+    if (-e $bwAvgOverBed){
+        unless (-d $bwAvgOverBed){
+            unless (-x $bwAvgOverBed){
+                die "##### AN ERROR has occurred: --bw option executable is not executable\n";
+            }
+        }
+        else{
+            die "##### AN ERROR has occurred: --bw option executable is directory\n";
+        }
+    }
+    else{
+        die "##### AN ERROR has occurred: --bw option executable ($bwAvgOverBed) nonexistent\n";
+    }
+  }
+  else{
+      $bwAvgOverBed = "bigWigAverageOverBed";
+  }
+  $call = "command -v $bwAvgOverBed > /dev/null 2>&1";
+  $ret = system ($call);
+  if ($ret != 0){
+      die "##### AN ERROR has occurred: No UCSCtools bigWigAverageOverBed executable found. Please provide path/filename of UCSCtools bigWigAverageOverBed executable with --bw option\n";
+  }
+  
+  if ((defined $groups) && (-e $groups)){
+    unless (-r $groups){
+        die "##### AN ERROR has occurred: required group file (option -g) not readable\n";
+    }
+    $groups = File::Spec->rel2abs($groups);
+  }
+  else{
+      die "##### AN ERROR has occurred: required group file (option -g) missing or nonexistent\n";
+  }
+  
+  if (!defined $min) {
+      $min = 1;
+  }
+  
+  if ((defined $bed) && (-e $bed)){
+    unless (-r $bed){
+        die "##### AN ERROR has occurred: required bed file (option -b) not readable\n";
+    }
+    $bed = File::Spec->rel2abs($bed);
+  }
+  else{
+      die "##### AN ERROR has occurred: required bed file (option -b) missing or nonexistent\n";
+  }
+}
+
+if ((defined $expr) && (-e $expr)){
+    unless (-r $expr){
+        die "##### AN ERROR has occurred: required expression file (option -e) not readable\n";
+    }
+    $expr = File::Spec->rel2abs($expr);
+}
+else{
+    die "##### AN ERROR has occurred: required expression file (option -e) missing or nonexistent\n";
+}
+
+if ((defined $methyl) && (-e $methyl)){
+    unless (-r $methyl){
+        die "##### AN ERROR has occurred: required methylation file (option -m) not readable\n";
+    }
+    $methyl = File::Spec->rel2abs($methyl);
+}
+else{
+    die "##### AN ERROR has occurred: required methylation file (option -m) missing or nonexistent\n";
+}
+
+if (!defined $group_id) {
+  $group_id = "g1,g2";
+}
+else {
+  @group_ids = split(/,/,$group_id)
+}
+
+# R
+if (defined $R){
+  $R = File::Spec->rel2abs($R);
+  if (-e $R){
+    unless (-d $R){
+	unless (-x $R){
+	die "##### AN ERROR has occurred: -R option executable is not executable\n";
+      }
+    }
+    else{
+      die "##### AN ERROR has occurred: -R option executable is directory\n";
+    }
+  }
+  else{
+    die "##### AN ERROR has occurred: -R option executable ($R) nonexistent\n";
+  }
+}
+else{
+  $R = "R";
+}
+$call = "command -v $R > /dev/null 2>&1";
+$ret = system ($call);
+if ($ret != 0){
+  die "##### AN ERROR has occurred: No R executable found. Please provide path/filename of R executable with -R option\n";
+}
+
+# latex
+if (defined $latex){
+  $latex = File::Spec->rel2abs($latex);
+  if (-e $latex){
+    unless (-d $latex){
+	unless (-x $latex){
+	die "##### AN ERROR has occurred: --latex option executable is not executable\n";
+      }
+    }
+    else{
+      die "##### AN ERROR has occurred: --latex option executable is directory\n";
+    }
+  }
+  else{
+    die "##### AN ERROR has occurred: --latex option executable ($latex) nonexistent\n";
+  }
+}
+else{
+  $latex = "latex";
+}
+$call = "command -v $latex > /dev/null 2>&1";
+$ret = system ($call);
+if ($ret != 0){
+  die "##### AN ERROR has occurred: No latex executable found. Please provide path/filename of latex executable with --latex option\n";
+}
+
+# dvipdf
+if (defined $dvipdf){
+  $dvipdf = File::Spec->rel2abs($dvipdf);
+  if (-e $dvipdf){
+    unless (-d $dvipdf){
+	unless (-x $dvipdf){
+	die "##### AN ERROR has occurred: --dvipdf option executable is not executable\n";
+      }
+    }
+    else{
+      die "##### AN ERROR has occurred: --dvipdf option executable is directory\n";
+    }
+  }
+  else{
+    die "##### AN ERROR has occurred: --dvipdf option executable ($dvipdf) nonexistent\n";
+  }
+}
+else{
+  $dvipdf = "dvipdf";
+}
+$call = "command -v $dvipdf > /dev/null 2>&1";
+$ret = system ($call);
+if ($ret != 0){
+  die "##### AN ERROR has occurred: No R executable found. Please provide path/filename of dvipdf executable with --dvipdf option\n";
+}
+
+if (!defined $prov) {
+  ################
+  #### output ####
+  ################
+  
+  my ($vol, $dir, $name, $template);
+  $template = 'expression_XXXXX';
+  ($EXPR, $expr_file) = tempfile($template, DIR => $directory, SUFFIX => ".input", UNLINK => 1);
+  $template = 'methylation_XXXXX';
+  ($METHYL, $methyl_file) = tempfile($template, DIR => $directory, SUFFIX => ".input", UNLINK => 1);
+  
+  ############################
+  #### groups and samples ####
+  ############################
+  open (IN, "$groups") || die "cannot open $groups\n";
+  while (<IN>) {
+    chomp $_;
+    my @in = split(/\t/, $_);
+    push(@sample, $in[0]);
+    push(@sample_group, $in[1]);
+  }
+  close (IN);
+  
+  
+  #####################
+  #### methylation ####
+  #####################
+  print STDERR ("[INFO]" . prettyTime() . "Calculating average methylation\n");
+  
+  my $k=0;
+  open (IN_M, "$methyl") || die "cannot open $methyl\n";
+  while (<IN_M>) {
+    chomp $_;
+    
+    my $file = File::Spec->rel2abs($_);
+    $call = "less $bed | awk '{print \$0\";\"NR}' | $bwAvgOverBed $file stdin stdout -bedOut=stdout | awk '{if(\$3 > $min){getline; gsub(\";[0-9]*\$\",\"\",\$4); print \"$sample[$k]\t$sample_group[$k]\t\"\$1\":\"\$2\"-\"\$3\"\t\"\$4\"\t\"\$5}else{getline}}' >>$methyl_file";
+    $ret  = system ($call); 
+    if ($ret != 0){
+      die "##### AN ERROR has occurred: bw file $file not avaliable or problem with $bed\n";
+    }
+    $k++;
+  }
+  close (IN_M);
+  
+  
+  ####################
+  #### expression ####
+  ####################
+  print STDERR ("[INFO]" . prettyTime() . "Getting expression values\n");
+  
+  my $l=0;
+  open (IN_E, "$expr") || die "cannot open $expr\n";
+  while (<IN_E>) {
+    chomp $_;
+    
+    my $file = File::Spec->rel2abs($_);
+    $call = "cut -f4 $bed | fgrep -w -f - $file | awk '{print \"$sample[$l]\t$sample_group[$l]\t\"\$1\"\t\"\$3}' >>$expr_file";
+    $ret  = system ($call); 
+    if ($ret != 0){
+      die "##### AN ERROR has occurred: bw file $file not avaliable or problem with $bed\n";
+    }
+    $l++;
+  }
+  close (IN_E);
+}
+else {
+    $expr_file		= $expr;
+    $methyl_file	= $methyl;
+}
+
+##################
+#### plotting ####
+##################
+print STDERR ("[INFO]" . prettyTime() . "Started plotting correlation plots\n");
+
+my $preout		= File::Spec->catpath($vol, $directory, "correlation");
+my $Rscript		= ($R . "script");
+my $plot_script	= File::Spec->rel2abs($0);
+$plot_script	= ($plot_script . ".R");
+$out			= ($out . ".txt");
+
+$call = "$Rscript $plot_script -e $expr_file -m $methyl_file -o $preout -p $group_ids[0] -q $group_ids[1] -s $out";
+
+if (defined $group_ids[2]) {
+  $call = ($call . " -r $group_ids[2]")
+}
+$call = ($call . " >/dev/null");
+
+$ret  = system ($call); 
+if ($ret != 0){
+  die "##### AN ERROR has occurred: problem with calling R\n";
+}
+
+print STDERR ("[INFO]" . prettyTime() . "Building graphics and cleaning up\n");
+my ($vol2, $dir, $name)  = File::Spec->splitpath($preout);
+open (IN_M, "cut -f3,4 $methyl_file | sort | uniq | ") || die "cannot open $methyl_file\n";
+while (<IN_M>) {
+  #print $_;
+  chomp $_;
+  my @in = split(/\t/, $_);
+  
+  my $tex		= File::Spec->catpath($vol, $dir, ($name . "_" . $in[0] . "_" . $in[1] . ".tex"));
+  my $plot_cor		= File::Spec->catpath($vol, $dir, ($name . "_" . $in[0] . "_" . $in[1] . ".cor.tmp.eps"));
+  my $plot_expr		= File::Spec->catpath($vol, $dir, ($name . "_" . $in[0] . "_" . $in[1] . ".expr.tmp.eps"));
+  my $title		= File::Spec->catpath($vol, $dir, ($name . "_" . $in[0] . "_" . $in[1] . ".text.tmp.eps"));
+  my $plot_methyl	= File::Spec->catpath($vol, $dir, ($name . "_" . $in[0] . "_" . $in[1] . ".methyl.tmp.eps"));
+
+  $in[0] =~ s/([:;])/\\$1/g;
+  $in[1] =~ s/([:;])/\\$1/g;
+  
+  my $tex2		= File::Spec->catpath($vol, $dir, ($name . "_" . $in[0] . "_" . $in[1] . ".tex"));
+  my $dvi		= File::Spec->catpath($vol, $dir, ($name . "_" . $in[0] . "_" . $in[1] . ".dvi"));
+  my $aux		= File::Spec->catpath($vol, $dir, ($name . "_" . $in[0] . "_" . $in[1] . ".aux"));
+  my $log		= File::Spec->catpath($vol, $dir, ($name . "_" . $in[0] . "_" . $in[1] . ".log"));
+  
+  if ((-e $plot_cor) && (-e $plot_expr) && (-e $title) && (-e $plot_methyl)) {  
+  
+    open(TEX,">$tex");
+    print TEX "\\documentclass[10pt]{article}
+    \\pagestyle{empty}
+    \\usepackage[utf8]{inputenc}
+    \\usepackage{amsmath}
+    \\usepackage{amsfonts}
+    \\usepackage{amssymb}
+    \\usepackage{graphicx}
+    \\begin{document}
+    
+    \\begin{picture}(500,500)
+    \\put(141,0){\\includegraphics[width=300pt,height=300pt,clip=]{$plot_cor}}
+    \\put(6,0){\\includegraphics[width=150pt,height=300pt,clip=]{$plot_expr}}
+    \\put(6,-135){\\includegraphics[width=160pt,height=180pt,clip=]{$title}}
+    \\put(141,-135){\\includegraphics[width=300pt,height=150pt,clip=]{$plot_methyl}}
+    \\end{picture}
+    \\end{document}
+    ";
+    close(TEX);
+    
+    chdir ($dir);
+    
+    $call = ("$latex -interaction=batchmode $tex2 >/dev/null");
+    $ret  = system ($call); 
+    if ($ret != 0){
+      die "##### AN ERROR has occurred\n";
+    }
+    $call = ("$dvipdf -q $dvi 2>/dev/null");
+    $ret  = system ($call); 
+    if ($ret != 0){
+      die "##### AN ERROR has occurred\n";
+    };
+  
+    $plot_cor	=~ s/([:;])/\\$1/g;
+    $plot_expr	=~ s/([:;])/\\$1/g;
+    $title	=~ s/([:;])/\\$1/g;
+    $plot_methyl	=~ s/([:;])/\\$1/g;
+    
+    $call = ("rm $aux $log $dvi $tex2 $plot_cor $plot_expr $title $plot_methyl");
+    $ret  = system ($call); 
+    if ($ret != 0){
+      die "##### AN ERROR has occurred\n";
+    }
+  }
+}
+close (IN_M);
+
+if (!defined $prov) {
+    $expr_file	=~ s/([:;])/\\$1/g;
+    $methyl_file	=~ s/([:;])/\\$1/g;
+    
+    $call = ("rm $expr_file $methyl_file");
+    $ret  = system ($call); 
+    if ($ret != 0){
+      die "##### AN ERROR has occurred\n";
+    }
+    
+    close ($EXPR);
+    close ($METHYL);
+}
+
+# -----------------------------------------------------------------------------
+# FUNCTIONS
+
+sub prettyTime{
+  my @months      = qw(Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec);
+  my @weekDays    = qw(Sun Mon Tue Wed Thu Fri Sat Sun);
+  my ($second, $minute, $hour, $dayOfMonth, $month, $yearOffset, $dayOfWeek, $dayOfYear, $daylightSavings) = localtime();
+  my $year        = 1900 + $yearOffset;
+  return "\t$weekDays[$dayOfWeek] $months[$month] $dayOfMonth, $hour:$minute:$second, $year\t";
+}

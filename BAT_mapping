@@ -1,0 +1,453 @@
+#!/usr/bin/env perl
+
+use strict;
+use warnings;
+
+use Getopt::Long;
+use File::Spec;
+use File::Path qw(make_path remove_tree);
+use File::Basename;
+
+# -----------------------------------------------------------------------------
+# Variables
+
+my ($USAGE, $OUT_LOG, $help, $call, $ret, $sam, $bam, $unmapped, $excluded, $ct_index, $ga_index, $log_file, $result_dir, $out_file, $make_tmp_flag, $volume, $cur_dir);
+my ($genome, $reads1, $reads2, $genome_index);
+my ($out, $segemehl, $samtools, $threads, $bisulfite_flag, $tmp_dir, $additional_segemehl, $nr_exclude);
+my $SCRIPTNAME = basename($0);
+my $VERSION    = "v0.1";
+
+# -----------------------------------------------------------------------------
+# OPTIONS
+
+$USAGE = << "USE";
+
+    usage:  perl $SCRIPTNAME  -g <string> -q <string> -i <string> -o <string> [-p <string>] [-t <number>] [-F <number>] [--tmp <string>] [-a <string>] [--segemehl <string>] [--samtools <string>] [--exclude <number>] [--stdout]
+
+    [INPUT]     -g          path/filename of reference genome fasta
+                -q          path/filename of query sequences (reads)
+                -p          path/filename of mate pair sequences (default: none)
+                -i          path/prefix of database indices
+                
+    [GENERAL]   -o          path/prefix of outfiles
+                -t          start <num_threads> threads (default: 1)
+                -F          bisulfite mapping with methylC-seq/Lister et al. (=1) or bs-seq/Cokus et al. protocol (=2) (default: 1)
+                -a          quoted string of additional segemehl parameters (default: none)
+                --tmp       path of temporary directory (default: result directory)
+                --exclude   if XF_flag>number, mapping is excluded from regular bam file (default: 3)
+                --segemehl  path/filename of segemehl executable (default: installed)
+                --samtools  path/filename of samtools (default: installed)
+USE
+
+if (!@ARGV) {
+    printf STDERR $USAGE;
+    exit -1;
+}
+
+unless (GetOptions(
+    "g=s"           => \$genome,
+    "q=s"           => \$reads1,
+    "p=s"           => \$reads2,
+    "i=s"           => \$genome_index,
+    "o=s"           => \$out,
+    "t=s"           => \$threads,
+    "F=s"           => \$bisulfite_flag,
+    "a=s"           => \$additional_segemehl,
+    "tmp=s"         => \$tmp_dir,
+    "exclude"       => \$nr_exclude,
+    "segemehl=s"    => \$segemehl,
+    "samtools=s"    => \$samtools,
+    "h|help"        => \$help)){
+    printf STDERR $USAGE;
+    exit -1;
+}
+if (defined $help){
+    printf STDERR $USAGE;
+    exit -1;
+}
+if (defined $help){
+    printf STDERR $USAGE;
+    exit -1;
+}
+
+# -----------------------------------------------------------------------------
+# MAIN
+## script name and version
+print STDERR ("[INFO]" . prettyTime() . "$SCRIPTNAME $VERSION started\n");
+
+#################
+## check flags ##
+#################
+print STDERR ("[INFO]" . prettyTime() . "Checking flags\n");
+
+## relative to absolut path ##
+if (defined $genome){$genome = File::Spec->rel2abs($genome)}
+if (defined $reads1){$reads1 = File::Spec->rel2abs($reads1)};
+if (defined $genome_index){$genome_index = File::Spec->rel2abs($genome_index)};
+if (defined $reads2){$reads2 = File::Spec->rel2abs($reads2);}
+if (defined $out){$out = File::Spec->rel2abs($out);}
+if (defined $tmp_dir){$tmp_dir = File::Spec->rel2abs($tmp_dir);}
+if (defined $segemehl){$segemehl = File::Spec->rel2abs($segemehl);}
+if (defined $samtools){$samtools = File::Spec->rel2abs($samtools);}
+$cur_dir = File::Spec->curdir();
+
+## out directory ##
+if (!defined $out){
+    printf STDERR $USAGE;
+    die "##### AN ERROR has occurred: required option -o missing\n";
+}
+else{
+    if ((-e $out) && (-d $out)){
+        die "##### AN ERROR has occurred: required option -o is directory and has to be path/prefix\n";
+    }
+    ($volume, $result_dir, $out_file) = File::Spec->splitpath($out);
+        
+    unless (-e $result_dir){
+        $ret = make_path($result_dir);
+        if ($ret != 1){
+            die "##### AN ERROR has occurred: Could not make result directory\n";
+        }
+        else{
+            print STDERR  ("[INFO]" . prettyTime() . "Created result-directory $result_dir\n");
+        }
+    }
+    elsif (-d $result_dir){
+        unless (-w $result_dir && -r $result_dir){
+            die "##### AN ERROR has occurred: --dir option directory not readable or writable\n";
+        }  
+    }
+}
+
+## segemehl executable ##
+if (defined $segemehl){
+    if (-e $segemehl){
+        unless (-d $segemehl){
+            unless (-x $segemehl){
+                die "##### AN ERROR has occurred: --segemehl option executable is not executable\n";
+            }
+        }
+        else{
+            die "##### AN ERROR has occurred: --segemehl option executable is directory\n";
+        }
+    }
+    else{
+        die "##### AN ERROR has occurred: --segemehl option executable nonexistent\n";
+    }
+}
+else{
+    $segemehl = "segemehl.x";
+    $call = "command -v $segemehl >/dev/null 2>&1";
+    $ret = system ($call);
+    if ($ret != 0){
+        die "##### AN ERROR has occurred: No segemehl executable (segemehl.x) found. Please provide path/filename of segemehl executable with --segemehl option\n";
+    }
+}
+
+## samtools ##
+if (defined $samtools){
+    if (-e $samtools){
+        unless (-d $samtools){
+            unless (-x $samtools){
+                die "##### AN ERROR has occurred: --samtools option executable is not executable\n";
+            }
+        }
+        else{
+            die "##### AN ERROR has occurred: --samtools option executable is directory\n";
+        }
+    }
+    else{
+        die "##### AN ERROR has occurred: --samtools option executable nonexistent\n";
+    }
+}
+else{
+    $samtools = "samtools";
+}
+$call = "command -v $samtools >/dev/null 2>&1";
+$ret = system ($call);
+if ($ret != 0){
+    die "##### AN ERROR has occurred: No samtools executable found. Please provide path/filename of samtools executable with --samtools option\n";
+}
+
+## genome ##
+if ((defined $genome) && (-e $genome)){
+    unless (-r $genome){
+        die "##### AN ERROR has occurred: genome (option -g) not readable\n";
+    }
+}
+else{
+    printf STDERR $USAGE;
+    die "##### AN ERROR has occurred: required option -g missing or nonexistent\n";
+}
+
+## query ##
+if ((defined $reads1) && (-e $reads1)){
+    unless (-r $reads1){
+        die "##### AN ERROR has occurred: query (option -p) not readable\n";
+    }
+}
+else {
+    printf STDERR $USAGE;
+    die "##### AN ERROR has occurred: required option -p missing\n";
+}
+
+## mate ##
+if (defined $reads2){
+    if (-e $reads2){
+        unless (-r $reads2){
+            die "##### AN ERROR has occurred: mate (option -q) not readable\n";
+        }
+    }
+    else {
+        die "##### AN ERROR has occurred: mate (option -q) not nonexistent\n";
+    }
+}
+
+## threads ##
+if (!defined $threads){
+    $threads = 1;
+}
+else{
+    unless ($threads > 0){
+        die "##### AN ERROR has occurred: option -t has to be numeric and >0\n";
+    }
+}
+
+## exclude XF ##
+if (!defined $nr_exclude){
+    $nr_exclude = 3;
+}
+else{
+    unless ($nr_exclude >= 0){
+        die "##### AN ERROR has occurred: option --exclude has to be numeric and positive\n";
+    }
+}
+
+## bisulfite flag ##
+if (defined $bisulfite_flag){
+    if ($bisulfite_flag != 1 && $bisulfite_flag != 2){
+        die "##### AN ERROR has occurred: No valid --bisulfite flag\n";
+    }
+}
+else{
+    $bisulfite_flag = 1;
+}
+
+## genome indices ##
+if (defined $genome_index){
+    $ct_index = $genome_index . ".ctidx";
+    $ga_index = $genome_index . ".gaidx";
+    if ((-e $ct_index) && (-e $ga_index)){
+        unless ((-r $ct_index) && (-r $ga_index)){
+            die "##### AN ERROR has occurred: genome indices (option -i) not readable\n";
+        }
+    }
+}
+else{
+    printf STDERR $USAGE;
+    die "##### AN ERROR has occurred: required option -i missing. At least path/prefix to build indicies is needed.\n";
+}
+
+## temporary directory ##
+if (!defined $tmp_dir){
+    $tmp_dir = $result_dir;
+}
+elsif (-d $tmp_dir){
+    unless ((-w $tmp_dir) && (-r $tmp_dir)){
+        die "##### AN ERROR has occurred: tmp option directory not readable or writable\n";
+    }
+}
+else{
+    $ret = make_path($tmp_dir);
+    if ($ret != 1){
+        die "##### AN ERROR has occurred: could not make temporary directory\n";
+    }
+    else{
+        print STDERR  ("[INFO]" . prettyTime() . "Created temporary directory $tmp_dir\n");
+        $make_tmp_flag = 1;
+    }
+}
+
+## out files ##
+if (defined $out_file){
+    $sam = (File::Spec->catpath($volume, $tmp_dir, $out_file) . ".sam");
+    $bam = (File::Spec->catpath($volume, $result_dir, $out_file) . ".bam");
+    $excluded = (File::Spec->catpath($volume, $result_dir, $out_file) . ".excluded.bam");
+    $unmapped = (File::Spec->catpath($volume, $result_dir, $out_file) . ".unmapped");
+    $log_file = (File::Spec->catpath($volume, $result_dir, $out_file) . ".mapping.log");
+    open($OUT_LOG, ">$log_file") or die "##### AN ERROR has occurred: could not open $log_file!\n";
+}
+else{
+    printf STDERR $USAGE;
+    die "##### AN ERROR has occurred: required option -o missing\n";
+}
+
+## additional segemehl parameters ##
+if (defined $additional_segemehl){
+    if ($additional_segemehl =~ m/-d/ || $additional_segemehl =~ m/--database/ || $additional_segemehl =~ m/-q/ || $additional_segemehl =~ m/--query/ || $additional_segemehl =~ m/-p/ || $additional_segemehl =~ m/--mate/ || $additional_segemehl =~ m/-i/ || $additional_segemehl =~ m/--index/ || $additional_segemehl =~ m/-j/ || $additional_segemehl =~ m/--index2/ || $additional_segemehl =~ m/-x/ || $additional_segemehl =~ m/--generate/ || $additional_segemehl =~ m/-y/ || $additional_segemehl =~ m/--generate2/ || $additional_segemehl =~ m/-F/ || $additional_segemehl =~ m/--bisulfite/ || $additional_segemehl =~ m/-u/ || $additional_segemehl =~ m/--nomatchfilename/ || $additional_segemehl =~ m/-t/ || $additional_segemehl =~ m/--threads/ || $additional_segemehl =~ m/-o/ || $additional_segemehl =~ m/--outfile/){
+        die "##### AN ERROR has occurred: Additional parameters match already set parameters. Please do not set:\n\t-d, --database\n\t-q, --query\n\t-p, --mate\n\t-i, --index\n\t-j, --index2\n\t-x, --generate\n\t-y, --generate2\n\t-F, --bisulfite\n\t-t, --threads\n\t-o, --outfile\n\t-u, --nomatchfilename\n";
+    }
+}
+
+chdir $tmp_dir;
+
+##########################
+## possibly build index ##
+##########################
+unless ((-e $ct_index) && (-e $ga_index)){
+    print STDERR  ("[INFO]" . prettyTime() . "Build genome indicies\n");
+    print $OUT_LOG  ("[INFO]" . prettyTime() . "Build genome indicies\n");
+    $call = "$segemehl -s -x $ct_index -y $ga_index -d $genome -F $bisulfite_flag >>$log_file 2>&1";
+    call($call);
+}
+
+####################
+### call segemehl ##
+####################
+print STDERR ("[INFO]" . prettyTime() . "Start mapping\n");
+print $OUT_LOG ("[INFO]" . prettyTime() . "Start mapping\n");
+
+$call = "$segemehl -s -d $genome -i $ct_index -j $ga_index -F $bisulfite_flag -t $threads -q $reads1 -u $unmapped -o $sam";
+if (defined $reads2){
+    $call = ($call . " -p $reads2");
+}
+if (defined $additional_segemehl){
+    $call = ($call . " $additional_segemehl");
+}
+$call = ($call . " >>$log_file 2>&1");
+call($call);
+
+#exit -1;
+
+#######################################
+### exclude reads with large XF flag ##
+### and convert both SAM -> BAM      ##
+#######################################
+if ($nr_exclude > 0){
+    print STDERR ("[INFO]" . prettyTime() . "Exclude reads from sam file ($sam) and convert nonexcluded and excluded output to bam files ($bam and $excluded)\n");
+    print $OUT_LOG ("[INFO]" . prettyTime() . "Exclude reads from sam file ($sam) and convert nonexcluded and excluded output to bam files ($bam and $excluded)\n");
+    
+		my $tin = ($tmp_dir . "/in_tmp_" . $out_file);
+		$tin =~ s/.bam//;
+		my $tex = ($tmp_dir . "/ex_tmp_" . $out_file);
+		$tex =~ s/.bam//;
+    
+    open(IN, "$sam") or die "##### AN ERROR has occurred: could not open $sam!\n";
+    open(OUT_BAM, "| $samtools view -bS - 2>>$log_file | $samtools sort -T $tin -m 10G -o $bam 2>>$log_file") or die "##### AN ERROR has occurred: could not open $bam!\n";
+    open(OUT_EX, "| $samtools view -bS - 2>>$log_file | $samtools sort -T $tex -m 10G -o $excluded  2>>$log_file") or die "##### AN ERROR has occurred: could not open $excluded!\n";
+    
+    while(<IN>){
+        if ($_ =~ m/^@/){
+            print OUT_BAM "$_";
+            print OUT_EX "$_";
+        }
+        else{
+            my @IN = split(/\t/,$_);
+            my $XF;
+            foreach (@IN){
+                my $tag = substr($_, 0, 5, "");
+                if ($tag eq "XF:i:"){
+                    $XF = $_;
+                }
+            }
+            
+            if ($XF<$nr_exclude){
+                print OUT_BAM "$_";
+            }
+            else{
+                print OUT_EX "$_";
+            }
+        }
+    }
+    
+    close(IN);
+    close(OUT_BAM);
+    close(OUT_EX);
+}
+else{
+    print STDERR ("[INFO]" . prettyTime() . "Convert output sam to bam file\n");
+    print $OUT_LOG ("[INFO]" . prettyTime() . "Convert output sam to bam file\n");
+    $call = ("$samtools view -bS " . $sam . " 2>>$log_file | $samtools sort -T all -m 10G -o " . $bam . " >>$log_file 2>&1");
+    call($call);
+}
+
+####################
+### bam indexing  ##
+### gzip unmapped ##
+####################
+if (-e $bam) {
+    print STDERR ("[INFO]" . prettyTime() . "Remove sam file\n");
+    print $OUT_LOG ("[SYSTEM CALL] " . prettyTime() . " remove " . $sam . "\n");
+    $ret = remove_tree($sam);
+    if ($ret == 0){
+        print STDERR ("[INFO]" . prettyTime() . "ERROR could not remove sam file ($sam)\n");
+        print $OUT_LOG ("ERROR could not remove sam file ($sam)\n");
+    }
+}
+else {
+    print STDERR ("[INFO]" . prettyTime() . "Could not exclude reads from $sam\n");
+}
+
+print STDERR ("[INFO]" . prettyTime() . "Gzip unmapped out file\n");
+print $OUT_LOG ("[INFO]" . prettyTime() . "Gzip unmapped out file\n");
+$call = ("gzip -f " . $unmapped . " >>$log_file 2>&1");
+call($call);
+    
+print STDERR ("[INFO]" . prettyTime() . "Index regular bam file\n");
+print $OUT_LOG ("[INFO]" . prettyTime() . "Index regular bam file\n");
+$call = ("$samtools index " . $bam . " >>$log_file 2>&1");
+call($call);
+    
+print STDERR ("[INFO]" . prettyTime() . "Index excluded bam file\n");
+print $OUT_LOG ("[INFO]" . prettyTime() . "Index excluded bam file\n");
+$call = ("$samtools index " . $excluded . " >>$log_file 2>&1");
+call($call);
+
+chdir ($cur_dir);
+
+if (defined $make_tmp_flag){
+    if ($make_tmp_flag == 1){
+        print STDERR ("[INFO]" . prettyTime() . "Remove previously built temporary directory\n");
+        print $OUT_LOG ("[INFO]" . prettyTime() . "Remove previously built temporary directory\n");
+        $ret = remove_tree($tmp_dir);
+        if ($ret == 0){
+            print STDERR ("[INFO]" . prettyTime() . "ERROR could not remove temporary directory\n");
+            print $OUT_LOG ("ERROR could not remove temporary directory\n");
+        }
+    }
+}
+
+close ($OUT_LOG);
+
+# -----------------------------------------------------------------------------
+# FUNCTIONS
+
+sub call{
+    my ($sub_call) = @_;
+    
+    print $OUT_LOG ("[SYSTEM CALL] " . prettyTime() . " " . $sub_call . "\n");
+    
+    $ret = system ($sub_call);
+    print $OUT_LOG ("\n");
+    
+    if ($ret != 0){
+        print $OUT_LOG ("ERROR in last command\n");
+        die "##### AN ERROR has occurred: Please view the log file\n";
+    }
+}
+
+sub prettyTime{
+    my @months      = qw(Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec);
+    my @weekDays    = qw(Sun Mon Tue Wed Thu Fri Sat Sun);
+    my ($second, $minute, $hour, $dayOfMonth, $month, $yearOffset, $dayOfWeek, $dayOfYear, $daylightSavings) = localtime();
+    my $year        = 1900 + $yearOffset;
+    return "\t$weekDays[$dayOfWeek] $months[$month] $dayOfMonth, $hour:$minute:$second, $year\t";
+}
+
+
+
+
+
+
+
+
+

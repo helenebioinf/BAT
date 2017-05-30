@@ -1,0 +1,303 @@
+#!/usr/bin/env perl
+
+use strict;
+use warnings;
+
+use Getopt::Long;
+use File::Spec;
+use File::Path qw(make_path remove_tree);
+use File::Temp qw/ tempfile tempdir /;
+use File::Basename;
+
+# -----------------------------------------------------------------------------
+# Variables
+
+my ($USAGE, $help, $ret, $call);
+my ($samtools, $merged, $bams, $ids, $cns, $dss, $dts, $fos, $kss, $lbs, $pis, $pls, $pus, $sms);
+my (@BAMs, @IDs, @CNs, @DSs, @DTs, @FOs, @KSs, @LBs, @PGs, @PIs, @PLs, @PUs, @SMs);
+my ($n_bams, $readgroup, $samtools_bams);
+my $SCRIPTNAME = basename($0);
+my $VERSION    = "v0.1";
+
+# -----------------------------------------------------------------------------
+# OPTIONS
+
+$USAGE = << "USE";
+
+    usage:  perl $SCRIPTNAME  -o <string> --bam <string>  [--samtools <string>] [--id <string>] [--cn <string>] [--ds <string>] [--dt <string>] [--fo <string>] [--ks <string>] [--lb <string>] [--pi <string>] [--pl <string>] [--pu <string>] [--sm <string>] [--id <string>]
+    [INPUT]     -o          path/filename of merged output BAM file
+                --bam       comma-seperated list of path/filename of BAMs to be merged
+                --samtools  path/filename of samtools (default: in PATH)
+                --id        cmma-separated list of read group identifiers, one for each BAM file (default: prefix of filename)
+                --cn        comma seperated list of names of sequencing centers produced the reads, one for each BAM file (default: none)
+                --ds        comma seperated list of descriptions, one for each BAM file (default: none)
+                --dt        comma seperated list of dates  (ISO8601 date or date/time) the runs were produced, one for each BAM file (default: none)
+                --fo        comma seperated list of flow ordres, one for each BAM file (default: none), Format: /\*|[ACMGRSVTWYHKDBN]+/
+                --ks        comma seperated list of arrays of nucleotide bases that correspond to the key sequence of each read, one for each BAM file (default: none)
+                --lb        comma seperated list of librarys, one for each BAM file (default: none)
+                --pi        comma seperated list of predicted median insert sizes, one for each BAM file (default: none)
+                --pl        comma seperated list of platforms/technologys used to produce the reads, one for each BAM file (default: none), valid values: CAPILLARY, LS454, ILLUMINA, SOLID, HELICOS, IONTORRENT, PACBIO
+                --pu        comma seperated list of platform units, one for each BAM file (default: none)
+                --sm        comma seperated list of samples, one for each BAM file (default: none)
+                --id        comma seperated list of read group identifiers, one for each BAM file (default: determined by the file name the read is coming from -> matches RG tag of the reads)
+                
+                comma seperated list -> no white spaces!
+USE
+
+if (!@ARGV) {
+    printf STDERR $USAGE;
+    exit -1;
+}
+
+unless (GetOptions(
+    "o=s"           => \$merged,
+    "bam=s"         => \$bams,
+    "samtools=s"    => \$samtools,
+    "id=s"          => \$ids,
+    "cn=s"          => \$cns,
+    "ds=s"          => \$dss,
+    "dt=s"          => \$dts,
+    "fo=s"          => \$fos,
+    "ks=s"          => \$kss,
+    "lb=s"          => \$lbs,
+    "pi=s"          => \$pis,
+    "pl=s"          => \$pls,
+    "pu=s"          => \$pus,
+    "sm=s"          => \$sms,
+    "h|help"        => \$help
+)){
+    printf STDERR $USAGE;
+    exit -1;
+}
+if (defined $help){
+    printf STDERR $USAGE;
+    exit -1;
+}
+
+# -----------------------------------------------------------------------------
+# MAIN
+## script name and version
+print STDERR ("[INFO]" . prettyTime() . "$SCRIPTNAME $VERSION started\n");
+
+#################
+## check flags ##
+#################
+print STDERR ("[INFO]" . prettyTime() . "Checking flags\n");
+
+## output, input bams ##
+if (!defined $merged){
+    printf STDERR $USAGE;
+    die "##### AN ERROR has occurred: required path/filename of merged output BAM file (option -o) missing\n";
+}
+
+if (!defined $bams){
+    printf STDERR $USAGE;
+    die "##### AN ERROR has occurred: required comma-seperated list of path/filename of BAMs to be merged (option --bam) missing\n";
+}
+
+## lists to array, equal length of lists, relative to absolut path ##
+@BAMs           = split(/,/, $bams);
+$n_bams         = scalar @BAMs;
+$samtools_bams  = ("");
+for (my $i=0; $i<$n_bams; $i++){
+    $BAMs[$i] = File::Spec->rel2abs($BAMs[$i]);
+    $samtools_bams = ($samtools_bams . $BAMs[$i] . " ");
+}
+
+$merged = File::Spec->rel2abs($merged);
+
+if (defined $ids){
+    @IDs = split(/,/, $ids);
+    if (scalar @IDs != $n_bams){
+        die "##### AN ERROR has occurred: --id option does not content same number of items as --bam contains BAM files\n";
+    }
+}
+else{
+    for (my $i=0; $i<$n_bams; $i++){
+        $IDs[$i] = (File::Spec->splitpath($BAMs[$i]))[2];
+        $IDs[$i] =~ s/.bam//;
+    }
+}
+
+if (defined $cns){
+    @CNs = split(/,/, $cns);
+    if (scalar @CNs != $n_bams){
+        die "##### AN ERROR has occurred: --cn option does not content same number of items as --bam contains BAM files\n";
+    }
+}
+if (defined $dss){
+    @DSs = split(/,/, $dss);
+    if (scalar @DSs != $n_bams){
+        die "##### AN ERROR has occurred: --ds option does not content same number of items as --bam contains BAM files\n";
+    }
+}
+if (defined $dts){
+    @DTs = split(/,/, $dts);
+    if (scalar @DTs != $n_bams){
+        die "##### AN ERROR has occurred: --dt option does not content same number of items as --bam contains BAM files\n";
+    }
+}
+if (defined $fos){
+    @FOs = split(/,/, $fos);
+    if (scalar @FOs != $n_bams){
+        die "##### AN ERROR has occurred: --fo option does not content same number of items as --bam contains BAM files\n";
+    }
+}
+if (defined $kss){
+    @KSs = split(/,/, $kss);
+    if (scalar @KSs != $n_bams){
+        die "##### AN ERROR has occurred: --ks option does not content same number of items as --bam contains BAM files\n";
+    }
+}
+if (defined $lbs){
+    @LBs = split(/,/, $lbs);
+    if (scalar @LBs != $n_bams){
+        die "##### AN ERROR has occurred: --lb option does not content same number of items as --bam contains BAM files\n";
+    }
+}
+if (defined $pis){
+    @PIs = split(/,/, $pis);
+    if (scalar @PIs != $n_bams){
+        die "##### AN ERROR has occurred: --pi option does not content same number of items as --bam contains BAM files\n";
+    }
+}
+if (defined $pls){
+    @PLs = split(/,/, $pls);
+    if (scalar @PLs != $n_bams){
+        die "##### AN ERROR has occurred: --pl option does not content same number of items as --bam contains BAM files\n";
+    }
+}
+if (defined $pus){
+    @PUs = split(/,/, $pus);
+    if (scalar @PUs != $n_bams){
+        die "##### AN ERROR has occurred: --pu option does not content same number of items as --bam contains BAM files\n";
+    }
+}
+if (defined $sms){
+    @SMs = split(/,/, $sms);
+    if (scalar @SMs != $n_bams){
+        die "##### AN ERROR has occurred: --sm option does not content same number of items as --bam contains BAM files\n";
+    }
+}
+
+## PG - Programs used for processing the read group ##
+for (my $i=0; $i<$n_bams; $i++){
+    $PGs[$i] = "BAT";
+}
+
+## samtools ##
+if (defined $samtools){
+    $samtools = File::Spec->rel2abs($samtools);
+    if (-e $samtools){
+        unless (-d $samtools){
+            unless (-x $samtools){
+                die "##### AN ERROR has occurred: --samtools option executable is not executable\n";
+            }
+        }
+        else{
+            die "##### AN ERROR has occurred: --samtools option executable is directory\n";
+        }
+    }
+    else{
+        die "##### AN ERROR has occurred: --samtools option executable nonexistent\n";
+    }
+}
+else{
+    $samtools = "samtools";
+}
+$call = "command -v $samtools > /dev/null 2>&1";
+$ret = system ($call);
+if ($ret != 0){
+    die "##### AN ERROR has occurred: No samtools executable found. Please provide path/filename of samtools executable with --samtools option\n";
+}
+
+
+############
+## header ##
+############
+## tmp header file ##
+my ($volume, $dir, $file)           = File::Spec->splitpath($merged);
+my ($tmpheader, $tmpHeader)         = tempfile(DIR => $dir, UNLINK => 1);
+my ($tmpreadgroup, $tmpReadgroup)   = tempfile(DIR => $dir, UNLINK => 1);
+
+chdir $dir;
+
+print STDERR  ("[INFO]" . prettyTime() . "Build header\n");
+$call = "$samtools view -H $BAMs[0] >$tmpHeader";
+call($call);
+
+$readgroup = ();
+for (my $i=0; $i<$n_bams; $i++){
+    $readgroup = ($readgroup . "\@RG\tID:$IDs[$i]\t");
+    if (defined $cns){
+        $readgroup = ($readgroup . "CN:$CNs[$i]\t");
+    }
+    if (defined $dss){
+        $readgroup = ($readgroup . "DS:$DSs[$i]\t");
+    }
+    if (defined $dts){
+        $readgroup = ($readgroup . "DT:$DTs[$i]\t");
+    }
+    if (defined $fos){
+        $readgroup = ($readgroup . "FO:$FOs[$i]\t");
+    }
+    if (defined $kss){
+        $readgroup = ($readgroup . "KS:$KSs[$i]\t");
+    }
+    if (defined $lbs){
+        $readgroup = ($readgroup . "LB:$LBs[$i]\t");
+    }
+    if (defined $pis){
+        $readgroup = ($readgroup . "PI:$PIs[$i]\t");
+    }
+    if (defined $pls){
+        $readgroup = ($readgroup . "PL:$PLs[$i]\t");
+    }
+    if (defined $pus){
+        $readgroup = ($readgroup . "PU:$PUs[$i]\t");
+    }
+    if (defined $sms){
+        $readgroup = ($readgroup . "SM:$SMs[$i]\t");
+    }
+    $readgroup = ($readgroup . "PG:$PGs[$i]\n");
+}
+print $tmpreadgroup "$readgroup";
+
+$call = "cat $tmpReadgroup >>$tmpHeader";
+call($call);
+
+
+#####################
+## merge and index ##
+#####################
+print STDERR  ("[INFO]" . prettyTime() . "Merge BAMs\n");
+$call = "samtools merge -rh $tmpHeader - $samtools_bams >$merged 2>/dev/null";
+call($call);
+print STDERR  ("[INFO]" . prettyTime() . "Index merged BAM\n");
+$call = "samtools index $merged";
+call($call);
+
+
+# -----------------------------------------------------------------------------ls 
+# FUNCTIONS
+
+sub call{
+    my ($sub_call) = @_;
+        
+    $ret = system ($sub_call);
+    
+    if ($ret != 0){
+        die "##### AN ERROR has occurred: Please view the log file\n";
+    }
+}
+
+sub prettyTime{
+    my @months      = qw(Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec);
+    my @weekDays    = qw(Sun Mon Tue Wed Thu Fri Sat Sun);
+    my ($second, $minute, $hour, $dayOfMonth, $month, $yearOffset, $dayOfWeek, $dayOfYear, $daylightSavings) = localtime();
+    my $year        = 1900 + $yearOffset;
+    return "\t$weekDays[$dayOfWeek] $months[$month] $dayOfMonth, $hour:$minute:$second, $year\t";
+}
+
+
+

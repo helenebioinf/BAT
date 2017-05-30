@@ -1,0 +1,351 @@
+#!/usr/bin/env perl
+
+use strict;
+use warnings;
+
+use Getopt::Long;
+use File::Spec;
+use File::Path qw(make_path remove_tree);
+use File::Basename;
+use List::Util qw(min max);
+
+# -----------------------------------------------------------------------------
+# Variables
+
+my ($USAGE, $OUT_LOG, $help, $ret, $call, $log, $in, $out, $path, $in_file, $R);
+my ($mode, $threads, $min_cpgs, $min_diff, $id1, $id2, $p_val, $length, $add, $caller);
+my ($plot_script, $pval_out, $pval_bed, $pdf, $bed);
+my $SCRIPTNAME = basename($0);
+my $VERSION    = "v0.1";
+
+# -----------------------------------------------------------------------------
+# OPTIONS
+
+$USAGE = << "USE";
+
+    usage:  perl $SCRIPTNAME  -q <string> -o <string> [-F <number>] [-p <number>] [-c <number>] [-d <number>] [-l <number>] [-a <string>] [-b <string>] [-z <string>] [--metilene <string>]
+    
+    [INPUT]     -q          path/filename of metilene input file, if mode 1 (default, option -F 1), DMR file, if mode 2 (option -F 2)
+	            -o          path/prefix of output files (default: input_path/metilene)
+                -F          mode: (1) call DMRs using metilene with default setting and group names group1 (-a) and group2 (-b), followed by filtering of the called DMRs using cutoffs below (-o, -p, -c, -d, -l) (default), (2) filter already called DMR file using cutoffs below (-o, -p, -c, -d, -l)
+                -p          maximum (<) adj. p-value (q-value) for output of significant DMRs (post-processing, default: 0.05)
+                -c          minimum (>=) cpgs (post-processing, default:10)
+                -d          minimum mean methylation difference (>=) (post-processing, default:0.1)
+                -l          minimum length of DMR [nt] (>=) (post-processing, default: 0)
+                -a          name of group A (default:"g1")
+                -b          name of group B (default:"g2")
+                -z          non-default parameter for calling metilene in quotes (e.g. threads and CpG distance: "-t <number> -M <number>")
+                -R	    path/filename of R executable (default in PATH)
+                --metilene  path/executable of metilene (default "metilene" in PATH)
+USE
+
+if (!@ARGV) {
+    printf STDERR $USAGE;
+    exit -1;
+}
+
+unless (GetOptions(
+    "F=s"       => \$mode,
+    "q=s"       => \$in,
+    "o=s"       => \$out,
+    "p=s"       => \$p_val,
+    "c=s"       => \$min_cpgs,
+    "d=s"       => \$min_diff,
+    "l=s"       => \$length,    
+    "a=s"       => \$id1,
+    "b=s"       => \$id2,
+    "z=s"       => \$add,
+    "metilene=s"=> \$caller,
+    "R=s" 	=> \$R,
+    "h|help"    => \$help
+)){
+    printf STDERR $USAGE;
+    exit -1;
+}
+if (defined $help){
+    printf STDERR $USAGE;
+    exit -1;
+}
+
+# -----------------------------------------------------------------------------
+# MAIN
+
+#################
+## check flags ##
+#################
+## script name and version
+print STDERR ("[INFO]" . prettyTime() . "$SCRIPTNAME $VERSION started\n");
+print STDERR ("[INFO]" . prettyTime() . "Checking flags\n");
+
+if (!defined $mode) {
+    $mode = 1;
+}
+if (($mode != 1) && ($mode != 2)) {
+    die "##### AN ERROR has occurred: -F option need to be 1 or 2\n";
+}
+
+## relative to absolut path ##
+if (defined $in){$in = File::Spec->rel2abs($in)};
+if (defined $out){$out = File::Spec->rel2abs($out)};
+if (defined $caller){$caller = File::Spec->rel2abs($caller)};
+$plot_script = File::Spec->rel2abs($0);
+
+## input ##
+if ((defined $in) && (-e $in)){
+    unless (-r $in){
+        die "##### AN ERROR has occurred: input (option -q) not readable\n";
+    }
+}
+else{
+    printf STDERR $USAGE;
+    die "##### AN ERROR has occurred: required option -q missing or nonexistent\n";
+}
+
+## metilene
+if ($mode == 1) {
+    if (defined $caller){
+        if (-e $caller){
+            unless (-d $caller){
+                unless (-x $caller){
+                    die "##### AN ERROR has occurred: --metilene option executable is not executable\n";
+                }
+            }
+            else{
+                die "##### AN ERROR has occurred: --metilene option executable is directory\n";
+            }
+        }
+        else{
+            die "##### AN ERROR has occurred: --metilene option executable nonexistent\n";
+        }
+    }
+    else{
+        $caller  = "metilene";
+        $call   = "command -v $caller > /dev/null 2>&1";
+        $ret    = system ($call);
+        if ($ret != 0){
+            die "##### AN ERROR has occurred: No metilene executable found. Please provide path/filename of metilene executable with --metilene option\n";
+        }
+    }
+}
+
+# R
+if (defined $R){
+  $R = File::Spec->rel2abs($R);
+  if (-e $R){
+    unless (-d $R){
+	unless (-x $R){
+	die "##### AN ERROR has occurred: -R option executable is not executable\n";
+      }
+    }
+    else{
+      die "##### AN ERROR has occurred: -R option executable is directory\n";
+    }
+  }
+  else{
+    die "##### AN ERROR has occurred: -R option executable ($R) nonexistent\n";
+  }
+}
+else{
+  $R = "R";
+}
+$call = "command -v $R > /dev/null 2>&1";
+$ret = system ($call);
+if ($ret != 0){
+  die "##### AN ERROR has occurred: No R executable found. Please provide path/filename of R executable with -R option\n";
+}
+
+## out dir
+my ($vol, $dir, $file) = File::Spec->splitpath($in);
+if (!defined $out){
+    $path = $dir;
+    $file = "metilene";
+    $out = File::Spec->catfile($vol, $path, $file);
+}
+else {
+    ($vol, $dir, $file) = File::Spec->splitpath($out);
+    $path = $dir;
+}
+unless (-e $path){
+    $ret = make_path($path);
+    if ($ret != 1){
+        die "##### AN ERROR has occurred: Could not make out directory $path\n";
+    }
+    else{
+        print STDERR  ("[INFO]" . prettyTime() . "Created result-directory $path\n");
+    }
+}
+elsif (-d $path){
+    unless (-w $path && -r $path){
+        die "##### AN ERROR has occurred: out directory $path not readable or writable\n";
+    }
+}
+
+## id group 1 ##
+if (!defined $id1){
+    $id1 = "group1";
+}
+    
+## id group 2 ##
+if (!defined $id2){
+    $id2 = "group2";
+}
+
+## min cpgs ##
+if (!defined $min_cpgs){
+    $min_cpgs = 10;
+}
+
+## min diff ##
+if (!defined $min_diff){
+    $min_diff = 0.1;
+}
+
+## pval filter ##
+if (!defined $p_val){
+    $p_val = 0.05;
+}
+
+## length ##
+if (!defined $length){
+    $length = 0;
+}
+
+## out files ##
+$log      = File::Spec->catpath($vol, $path, $file);
+$log      = ($out . ".log");
+$out      = File::Spec->catpath($vol, $path, $file);
+$out      = ($out . ".out");
+$pval_out = File::Spec->catpath($vol, $path, $file);
+$pval_out = ($pval_out . "_qval." . $p_val . ".out");
+$pval_bed = File::Spec->catpath($vol, $path, $file);
+$pval_bed = ($pval_bed . "_qval." . $p_val . ".bedgraph");
+$bed      = File::Spec->catpath($vol, $path, $file);
+$bed      = ($bed . "_qval." . $p_val . ".bed");
+$pdf      = File::Spec->catpath($vol, $path, $file);
+$pdf      = ($pdf . "_qval." . $p_val . ".pdf");
+
+
+$plot_script = ($plot_script . ".R");
+
+open($OUT_LOG, ">$log") or die "##### AN ERROR has occurred: could not open $log!\n";
+
+################
+### call DMRs ##
+################
+if ($mode == 1) {
+    print STDERR ("[INFO]" . prettyTime() . "Calling DMRs.\n");
+    print $OUT_LOG ("[INFO]" . prettyTime() . "Calling DMRs.\n");
+    
+    $call = "$caller -a $id1 -b $id2";
+    
+    if (defined $add) {
+        $add =~ s/,/ /g;
+        $call = ($call . " " . $add);
+    }
+    print $OUT_LOG ("[metilene]" . prettyTime() . "\n");
+    close ($OUT_LOG);
+    
+    $call = ("( $call $in >$out ) 2>&1 | grep name >> $log");
+    #$call = ($call . " $in >$out");
+    #print "$call\n";
+    call($call);
+}
+
+open($OUT_LOG, ">>$log") or die "##### AN ERROR has occurred: could not open $log!\n";
+
+##################
+### filter DMRs ##
+##################
+
+if ($mode == 1) {
+    $in_file = $out;
+}
+else {
+    $in_file = $in;
+}
+
+
+print STDERR ("[INFO]" . prettyTime() . "Filtering DMRs.\n");
+print $OUT_LOG ("[INFO]" . prettyTime() . "Filtering DMRs.\n");
+
+my $count = 0;
+open(OUT, ">$pval_out") or die "##### AN ERROR has occurred: could not write to $pval_out\n";
+open(OUT_B, ">$pval_bed") or die "##### AN ERROR has occurred: could not write to $pval_bed\n";
+open(OUT_BED, ">$bed") or die "##### AN ERROR has occurred: could not write to $bed\n";
+
+open (IN, "$in_file") || die "cannot open $in_file\n";
+    while (<IN>) {
+    chomp;
+    
+    my ($chr, $start, $end, $pval, $diff_methyl, $nr_cpgs, $MWU, $KS2D, $mean_g1, $mean_g2) = split(/\t/,$_);
+    if (($pval < $p_val) && (abs($diff_methyl) >= $min_diff) && ($nr_cpgs >= $min_cpgs) && (($end-$start) >= $length)) {
+        $count++;
+        print OUT "$chr\t$start\t$end\t$pval\t$diff_methyl\t$nr_cpgs\t$mean_g1\t$mean_g2\n";
+        print OUT_B "$chr\t$start\t$end\t$diff_methyl\n";
+        if ($diff_methyl < 0) {
+            print OUT_BED "$chr\t$start\t$end\tDMR_$count\thypomethylated\n";
+        }
+        else {
+            print OUT_BED "$chr\t$start\t$end\tDMR_$count\thypermethylated\n";
+        }
+    }
+}
+close (IN);
+close (OUT);
+close (OUT_B);
+close (OUT_BED);
+
+my @i=split(/-/,$add);
+foreach my $t (@i){
+    if($t=~m/^d/){
+        $t=~s/d //;
+        $min_diff = max($min_diff, $t);
+    }
+}
+
+foreach my $t (@i){
+    if($t=~m/^m/){
+        $t=~s/m //;
+        $min_cpgs = max($min_cpgs, $t);
+    }
+}
+
+print STDERR ("[INFO]" . prettyTime() . "Wrote $count DMRs with adj. p-value < $p_val, a minimum absolute difference >= $min_diff, a minimum length [CpG] >= $min_cpgs and a minimum length [nt] >= $length\n");
+print STDERR ("[INFO]" . prettyTime() . "Bedgraph file containing DMR difference: $pval_bed\nBed file containing unique DMR identifier and hypo/hypermethylated annotation: $bed\n");
+print $OUT_LOG ("[INFO]" . prettyTime() . "Wrote $count DMRs with adj. p-value < $p_val, a minimum absolute difference >= $min_diff, a minimum length [CpG] >= $min_cpgs and a minimum length [nt] >= $length\n");
+print $OUT_LOG ("[INFO]" . prettyTime() . "Bedgraph file containing DMR difference: $pval_bed\nBed file containing unique DMR identifier and hypo/hypermethylated annotation: $bed\n");
+
+#################
+### plot stats ##
+#################
+#print "$plot_script $pval_out $pdf\n";
+print STDERR ("[INFO]" . prettyTime() . "Plotting DMR statistics ($pdf).\n");
+print $OUT_LOG ("[INFO]" . prettyTime() . "Plotting DMR statistics ($pdf).\n");
+my $Rscript = ($R . "script");
+$call = ("$Rscript $plot_script $pval_out $pdf $id1 $id2");
+call($call);
+
+close ($OUT_LOG);
+
+# -----------------------------------------------------------------------------ls
+# FUNCTIONS
+
+sub call{
+    my ($sub_call) = @_;
+    $ret = system ($sub_call);
+
+    if ($ret != 0){
+        die "##### AN ERROR has occurred. Occurred at: $sub_call\n";
+    }
+}
+
+sub prettyTime{
+    my @months      = qw(Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec);
+    my @weekDays    = qw(Sun Mon Tue Wed Thu Fri Sat Sun);
+    my ($second, $minute, $hour, $dayOfMonth, $month, $yearOffset, $dayOfWeek, $dayOfYear, $daylightSavings) = localtime();
+    my $year        = 1900 + $yearOffset;
+    return "\t$weekDays[$dayOfWeek] $months[$month] $dayOfMonth, $hour:$minute:$second, $year\t";
+}
+
+
+

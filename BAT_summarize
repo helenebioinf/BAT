@@ -1,0 +1,625 @@
+#!/usr/bin/env perl
+
+use strict;
+use warnings;
+
+use Getopt::Long;
+use File::Spec;
+use List::Util qw/sum min max/;
+use File::Temp qw/tempfile tempdir/;
+use File::Basename;
+
+# -----------------------------------------------------------------------------
+# Variables
+
+my ($USAGE, $call, $ret, $help);
+my ($in1, $in2, $out, $NA, $NA1, $NA2, $h1, $h2, $l, $bedtools, $circo_path, $circo_exec, $bgbw, $cs);
+my ($out_mean1, $out_mean2, $out_diff, $out_summary, $out_metilene);
+my (@g_ids, @g1, @g2, @g1_h, @g2_h);
+my $order = "";
+my $SCRIPTNAME = basename($0);
+my $VERSION    = "v0.1";
+
+# -----------------------------------------------------------------------------
+# OPTIONS
+
+
+## R executable! checking of ALL flags
+
+$USAGE = << "USE";
+
+    usage:  perl $SCRIPTNAME --in1 <string> --in2 <string> --out <string> --cs <string> [--mis <string>] [--mis1 <number>] [--mis2 <number>] [--h1 <string>] [--h2 <string>] [--cir <string>] [--groups <list>] [-c <string>]  [-b <string>] [--bgbw <string>]
+
+    [INPUT]     --in1       comma-seperated list of bedgraph input files of group 1
+                --in2       comma-seperated list of bedgraph input files of group 2
+                --out       path/prefix of out files (mean methylation rates, difference in mean methylation rates (group1 - group2), all samples bedgraphs and bigwigs, and metilene input,
+                            bedgraph file for each input bedgraph file containing positions sufficiently covered by all samples)
+                --cs        path/file of chrom.sizes of corresponding genome
+                --mis       string how missing values are coded (default: NA)
+                --mis1      number of max. missing values in group 1 allowed (else discard position, default: 0)
+                --mis2      number of max. missing values in group 2 allowed (else discard position, default: 0)
+                --h1        identifiers of group 1 samples (default: filenames)
+                --h2        identifiers of group 2 samples (default: filenames)
+                --cir       path of circos folder, (default: in root)
+                --groups    comma-seperated group ids (one for each group, default: g1, g2)
+                -c          path/prefix of circos executable (default: in PATH)
+                -b          path/prefix of bedtools executable (default: in PATH)
+                --bgbw      path/prefix of UCSCtools bedGraphToBigWig executable (default: in PATH)
+USE
+
+if (!@ARGV) {
+    printf STDERR $USAGE;
+    exit -1;
+}
+
+unless (GetOptions(
+    "in1=s" => \$in1,
+    "in2=s" => \$in2,
+    "out=s" => \$out,
+    "cs=s"  => \$cs,
+    "mis=s"  => \$NA,
+    "mis1=s" => \$NA1,
+    "mis2=s" => \$NA2,
+    "h1=s"  => \$h1,
+    "h2=s"  => \$h2,
+    "cir=s" => \$circo_path,
+    "groups=s" => \$l,
+    "c=s"   => \$circo_exec,
+    "b=s"   => \$bedtools,
+    "bgbw=s"=> \$bgbw,
+    "h|help"=> \$help
+)){
+    printf STDERR $USAGE;
+    exit -1;
+}
+if (defined $help){
+    printf STDERR $USAGE;
+    exit -1;
+}
+
+# -----------------------------------------------------------------------------
+# MAIN
+## script name and version
+print STDERR ("[INFO]" . prettyTime() . "$SCRIPTNAME $VERSION started\n");
+
+my $cur_dir = File::Spec->curdir();
+
+############
+## checks ##
+############
+print STDERR ("[INFO]" . prettyTime() . "Checking flags\n");
+
+if (defined $in1){
+    @g1 = split(/,/,$in1);
+    
+    for (my $i=0; $i<scalar(@g1); $i++){
+        $g1[$i] = File::Spec->rel2abs($g1[$i]);
+        
+        if ((defined $g1[$i]) && (-e $g1[$i])){
+            unless (-r $g1[$i]){
+                die "##### AN ERROR has occurred: $g1[$i] (option --g1) not readable\n";
+            }
+        }
+        else{
+            die "##### AN ERROR has occurred: required option --g1 ($g1[$i]) missing or nonexistent\n";
+        }
+    }
+}
+else {
+    printf STDERR $USAGE;
+    die "##### AN ERROR has occurred: required option --$in1 missing\n";
+}
+
+if (defined $in2){
+    @g2 = split(/,/,$in2);
+    
+    for (my $i=0; $i<scalar(@g2); $i++){
+        $g2[$i] = File::Spec->rel2abs($g2[$i]);
+        
+        if ((defined $g2[$i]) && (-e $g2[$i])){
+            unless (-r $g2[$i]){
+                die "##### AN ERROR has occurred: $g2[$i] (option --g2) not readable\n";
+            }
+        }
+        else{
+            die "##### AN ERROR has occurred: required option --g2 ($g2[$i]) missing or nonexistent\n";
+        }
+    }
+}
+else {
+    printf STDERR $USAGE;
+    die "##### AN ERROR has occurred: required option --$in2 missing\n";
+}
+
+if (defined $cs){
+    $cs = File::Spec->rel2abs($cs);
+    if (-e $cs){
+        unless (-r $cs){
+            die "##### AN ERROR has occurred: $cs (option --cs) not readable\n";
+        }
+    }
+    else{
+        die "##### AN ERROR has occurred: required option --cs ($cs) missing or nonexistent\n";
+    }
+}
+else {
+    printf STDERR $USAGE;
+    die "##### AN ERROR has occurred: required option --cs missing\n";
+}
+
+if (defined $l) {
+    @g_ids = split(/,/,$l);
+    
+    if (scalar(@g_ids > 2)) {
+        print "##### WARNING: option -l contains more than 2 values. Only the first two will be used ($g_ids[0] and $g_ids[1])\n";
+    }
+    elsif(scalar(@g_ids < 2)){
+        print "##### WARNING: option -l contains less than 2 values. Option will be ignored\n";
+    }
+}
+else {
+    @g_ids = ("g1","g2")
+}
+
+if (defined $out){
+    $out            = File::Spec->rel2abs($out);
+    $out_mean1      = ($out . "_mean_" . $g_ids[0] . ".bedgraph");
+    $out_mean2      = ($out . "_mean_" . $g_ids[1] . ".bedgraph");
+    $out_diff       = ($out . "_diff_" . $g_ids[0] . "_" . $g_ids[1] . ".bedgraph");
+    $out_summary    = ($out . "_summary_" . $g_ids[0] . "_" . $g_ids[1] . ".bedgraph");
+    $out_metilene   = ($out . "_metilene_" . $g_ids[0] . "_" . $g_ids[1] . ".txt");
+}
+else {
+    printf STDERR $USAGE;
+    die "##### AN ERROR has occurred: required option --out missing\n";
+}
+
+if (!defined $NA) {
+    $NA = "NA";
+}
+if (!defined $NA1) {
+    $NA1 = 0;
+}
+if (!defined $NA2) {
+    $NA2 = 0;
+}
+
+if (defined $h1) {
+    @g1_h = split(/,/,$h1);
+}
+else {
+    for (my $i=0; $i<scalar(@g1); $i++){
+        $g1_h[$i] = basename($g1[$i]);
+    }
+}
+
+if (defined $h2) {
+    @g2_h = split(/,/,$h2);
+}
+else {
+    for (my $i=0; $i<scalar(@g2); $i++){
+        $g2_h[$i] = basename($g2[$i]);
+    }
+}
+
+if (scalar(@g1) != scalar(@g1_h) || scalar(@g2) != scalar(@g2_h)) {
+    die "##### AN ERROR has occurred: List of sample identifiers does not match number of input bedgraphs.\n";
+}
+
+#circos
+if (defined $circo_path) {
+    $circo_path = File::Spec->rel2abs($circo_path);
+}
+    
+if (defined $circo_exec){
+    $circo_exec = File::Spec->rel2abs($circo_exec);
+    if (-e $circo_exec){
+        unless (-d $circo_exec){
+            unless (-x $circo_exec){
+                die "##### AN ERROR has occurred: -c option executable is not executable\n";
+            }
+        }
+        else{
+            die "##### AN ERROR has occurred: -c option executable is directory\n";
+        }
+    }
+    else{
+        die "##### AN ERROR has occurred: -c option executable nonexistent\n";
+    }
+}
+else{
+    $circo_exec = "circos";
+}
+$call = "command -v $circo_exec > /dev/null 2>&1";
+$ret = system ($call);
+if ($ret != 0){
+    die "##### AN ERROR has occurred: No circos executable found. Please provide path/filename of circos executable with -c option\n";
+}
+
+## bedtools ##
+if (defined $bedtools){
+    $bedtools = File::Spec->rel2abs($bedtools);
+    if (-e $bedtools){
+        unless (-d $bedtools){
+            unless (-x $bedtools){
+                die "##### AN ERROR has occurred: --bedtools option executable is not executable\n";
+            }
+        }
+        else{
+            die "##### AN ERROR has occurred: --bedtools option executable is directory\n";
+        }
+    }
+    else{
+        die "##### AN ERROR has occurred: --bedtools option executable nonexistent\n";
+    }
+}
+else{
+    $bedtools = "bedtools";
+}
+$call = "command -v $bedtools > /dev/null 2>&1";
+$ret = system ($call);
+if ($ret != 0){
+    die "##### AN ERROR has occurred: No bedtools executable found. Please provide path/filename of bedtools executable with --bedtools option\n";
+}
+
+
+## bedGraphToBigWig ##
+if (defined $bgbw){
+    $bgbw = File::Spec->rel2abs($bgbw);
+    if (-e $bgbw){
+        unless (-d $bgbw){
+            unless (-x $bgbw){
+                die "##### AN ERROR has occurred: --bgbw option executable is not executable\n";
+            }
+        }
+        else{
+            die "##### AN ERROR has occurred: --bgbw option executable is directory\n";
+        }
+    }
+    else{
+        die "##### AN ERROR has occurred: --bgbw option executable nonexistent\n";
+    }
+}
+else{
+    $bgbw = "bedGraphToBigWig";
+}
+$call = "command -v $bgbw > /dev/null 2>&1";
+$ret = system ($call);
+if ($ret != 0){
+    die "##### AN ERROR has occurred: No bedGraphToBigWig executable found. Please provide path/filename of bedGraphToBigWig executable with --bgbw option\n";
+}
+
+#####################
+## union bedgraph ##
+####################
+print STDERR ("[INFO]" . prettyTime() . "Calculation of summary files\n");
+
+open(OUT_S, ">$out_summary") or die "##### AN ERROR has occurred: could not write to $out_summary\n";
+open(OUT_1, ">$out_mean1") or die "##### AN ERROR has occurred: could not write to $out_mean1\n";
+open(OUT_2, ">$out_mean2") or die "##### AN ERROR has occurred: could not write to $out_mean2\n";
+open(OUT_D, ">$out_diff") or die "##### AN ERROR has occurred: could not write to $out_diff\n";
+open(OUT, ">$out_metilene") or die "##### AN ERROR has occurred: could not write to $out_metilene\n";
+
+open(IN, "$bedtools unionbedg -header -names @g1_h @g2_h -filler $NA -i @g1 @g2  | ") or die "Error in union bedgraph\n";
+
+while(<IN>){
+    if ($_ =~ m/chrom\tstart\tend/) {
+        print OUT_S "#chr\tstart\tend";
+        print OUT "chr\tpos";
+        
+        chomp $_;
+        my @in = split(/\t/,$_);
+        for my $i (@in[3..scalar(@g1)+2]){
+            print OUT_S ("\t" . $g_ids[0] . "_" . $i);
+            print OUT ("\t" . $g_ids[0] . "_" . $i);
+        }
+        for my $i (@in[scalar(@g1)+3..scalar(@g1)+scalar(@g2)+2]){
+            print OUT_S ("\t" . $g_ids[1] . "_" . $i);
+            print OUT ("\t" . $g_ids[1] . "_" . $i);
+        }
+        print OUT_S "\n";
+        print OUT "\n";
+        
+        print OUT_D ("#chr\tstart\tend\tdiff_" . $g_ids[0] . "_minus_" . $g_ids[1] . "\n");
+        print OUT_1 ("#chr\tstart\tend\tmean_" . $g_ids[0] . "\n");
+        print OUT_2 ("#chr\tstart\tend\tmean_" . $g_ids[01] . "\n");
+    }
+    else{
+        chomp $_;
+        my @in = split(/\t/,$_);
+        
+        my ($c1, $c2) = (0, 0);
+        if ($_ =~ m/$NA/) {
+            my $a = join(",", @in[3..scalar(@g1)+2]);
+            my $b = join(",", @in[(scalar(@g1)+3)..(scalar(@in)-1)]);
+            
+            $c1 = () = join(",", @in[3..scalar(@g1)+2]) =~ /$NA/gi;
+            if ($c1 <= $NA1) {
+                $c2 = () = join(",", @in[(scalar(@g1)+3)..(scalar(@in)-1)]) =~ /$NA/gi;
+            }
+        }
+        
+        if ($c1 <= $NA1 && $c2 <= $NA2) {
+            my $line = join("\t", @in[2..(scalar(@in)-1)]);
+            
+            print OUT_S "$_\n";
+            print OUT "$in[0]\t$line\n";
+            
+            my ($m1, $k1, $m2, $k2, $d) = (0)x5;
+            foreach my $i (@in[3..scalar(@g1)+2]){
+                if ($i ne $NA) {
+                    $m1 += $i;
+                    $k1++;
+                }
+            }
+            foreach my $i (@in[(scalar(@g1)+3)..(scalar(@in)-1)]){
+                if ($i ne $NA) {
+                    $m2 += $i;
+                    $k2++;
+                }
+            }
+            
+            if ($k1 == 0) {
+                $m1 = $NA;
+            }
+            else {
+                $m1 /= $k1;
+            }
+            if ($k2 == 0) {
+                $m2 = $NA;
+            }
+            else {
+                $m2 /= $k2;
+            }
+            if ($k1 == 0 || $k2 == 0) {
+                $d = $NA;
+            }
+            else {
+                $d = $m1 - $m2;
+            }
+            
+            if ($m1 ne $NA) {
+                print OUT_1 "$in[0]\t$in[1]\t$in[2]\t$m1\n";
+            }
+            if ($m2 ne $NA) {
+                print OUT_2 "$in[0]\t$in[1]\t$in[2]\t$m2\n";
+            }if ($d ne $NA) {
+                print OUT_D "$in[0]\t$in[1]\t$in[2]\t$d\n";
+            }
+        }
+    }
+}    
+
+close (OUT_S);
+close (OUT_1);
+close (OUT_2);
+close (OUT_D);
+close (OUT);
+close (IN);
+
+# convert mean and difference files to bigwig
+for my $fbg ($out_mean1, $out_mean2, $out_diff) {
+    my $fbw = $fbg;
+    $fbw =~ s/.bedgraph$/.bw/;
+    $call = "$bgbw $fbg $cs $fbw";
+    $ret = system ($call);
+    if ($ret != 0){
+        print "##### AN ERROR has occurred: Could not convert $fbg to $fbw\n";
+    }
+}
+    
+# write bedgraph and bw files
+print STDERR ("[INFO]" . prettyTime() . "Writing bedgraph files and converting to bw\n");
+my $col = 3;
+for (my $i=0; $i<scalar(@g1_h); $i++){
+    my $out_bg;
+    my $out_bw;
+    
+    if (defined $h1) {
+        $out_bg = ($out . "_" . $g1_h[$i] . ".bedgraph");
+        $out_bw = ($out . "_" . $g1_h[$i] . ".bw");
+    }
+    else {
+        $out_bg = ($out . "_" . $g1_h[$i]);
+        $out_bw = ($out . "_" . $g1_h[$i]);
+        if ($out_bw =~ m/.bedgraph$/) {
+            $out_bw =~ s/.bedgraph$//;
+        }
+        elsif ($out_bw =~ m/.bed$/) {
+            $out_bw =~ s/.bed$//;
+        }
+        elsif ($out_bw =~ m/.bg$/) {
+            $out_bw =~ s/.bg$//;
+        }
+        $out_bw = ($out_bw . ".bw");
+    }
+    
+    $col++;
+    
+    $call = "cut -f1-3,$col $out_summary | grep -v $NA >$out_bg";
+    $ret = system ($call);
+    if ($ret != 0){
+        die "##### AN ERROR has occurred: Could not write to $out_bg or read $out_summary\n";
+    }
+    
+    $call = "$bgbw $out_bg $cs $out_bw";
+    $ret = system ($call);
+    if ($ret != 0){
+        print "##### AN ERROR has occurred: Could not convert $out_bg to $out_bw\n";
+    }
+}
+
+for (my $i=0; $i<scalar(@g2_h); $i++){
+    my $out_bg;
+    my $out_bw;
+    if (defined $h2) {
+        $out_bg = ($out . "_" . $g2_h[$i] . ".bedgraph");
+        $out_bw = ($out . "_" . $g2_h[$i] . ".bw");
+    }
+    else {
+        $out_bg = ($out . "_" . $g2_h[$i]);
+        $out_bw = ($out . "_" . $g2_h[$i]);
+        if ($out_bw =~ m/.bedgraph$/) {
+            $out_bw =~ s/.bedgraph$//;
+        }
+        elsif ($out_bw =~ m/.bed$/) {
+            $out_bw =~ s/.bed$//;
+        }
+        elsif ($out_bw =~ m/.bg$/) {
+            $out_bw =~ s/.bg$//;
+        }
+        $out_bw = ($out_bw . ".bw");
+    }
+    
+    $col++;
+    
+    $call = "cut -f1-3,$col $out_summary | grep -v $NA >$out_bg";
+    $ret = system ($call);
+    if ($ret != 0){
+        die "##### AN ERROR has occurred: Could not write to $out_bg or read $out_summary\n";
+    }
+    
+    $call = "$bgbw $out_bg $cs $out_bw";
+    $ret = system ($call);
+    if ($ret != 0){
+        print "##### AN ERROR has occurred: Could not convert $out_bg to $out_bw\n";
+    }
+}
+
+# plot circos
+if (defined $circo_path) {
+    my ($vol, $dir, $name)  = File::Spec->splitpath($out);
+    my $plot = File::Spec->catpath($vol, $circo_path, "circos.png");
+    my $svg = File::Spec->catpath($vol, $circo_path, "circos.svg");
+    my $conf = File::Spec->catpath($vol, $circo_path, ($name . ".conf"));
+    my @circos;
+    my $bins;
+    
+    print STDERR ("[INFO]" . prettyTime() . "Plotting circos ($plot, $svg). Order of tracks from out -> in: @g1_h @g2_h\n");
+
+    my @chr = `cut -f1 $out_summary | grep -v "#" | sort -V -k1,1 | uniq | sed 's/chr/hs/'`;
+    my $chroms = join(";", @chr);
+    $chroms    =~ s/\n//g;
+    
+    if (scalar(@chr) <= 1) {
+        $bins = File::Spec->catpath($vol, $circo_path, "hg19.windows1000bp.bed");
+    }
+    elsif (scalar(@chr) <= 10) {
+        $bins = File::Spec->catpath("", $circo_path, "hg19.windows1MB.bed");
+    }
+    else {
+        $bins = File::Spec->catpath("", $circo_path, "hg19.windows10MB.bed");
+    }
+    
+    if (-e $bins){
+        unless (-r $bins){
+            die "##### AN ERROR has occurred: $bins not readable\n";
+        }
+    }
+    else{
+        die "##### AN ERROR has occurred: $bins nonexistent.\n";
+    }
+    
+    my $col = 3;
+    my $out_circo;
+    
+    for (my $i=0; $i<scalar(@g1_h); $i++){
+        $out_circo = File::Spec->catpath($vol, $circo_path, ($g1_h[$i] . ".circo"));
+        push(@circos, ($g1_h[$i] . ".circo"));
+        $col++;
+        
+        $call = "cut -f1-3,$col $out_summary | $bedtools intersect -wa -wb -a $bins -b stdin | $bedtools groupby -g 1,2,3 -c 8 -o mean | sed 's/chr/hs/' >$out_circo";
+        $ret = system ($call);
+        if ($ret != 0){
+            die "##### AN ERROR has occurred: Could not write to $out_circo or read $out_summary\n";
+        }
+    }
+    
+    for (my $i=0; $i<scalar(@g2_h); $i++){
+        $out_circo = File::Spec->catpath($vol, $circo_path, ($g2_h[$i] . ".circo"));
+        push(@circos, ($g2_h[$i] . ".circo"));
+        $col++;
+        
+        $call = "cut -f1-3,$col $out_summary | $bedtools intersect -wa -wb -a $bins -b stdin | $bedtools groupby -g 1,2,3 -c 8 -o mean | sed 's/chr/hs/' >$out_circo";
+        $ret = system ($call);
+        if ($ret != 0){
+            die "##### AN ERROR has occurred: Could not write to $out_circo or read $out_summary\n";
+        }
+    }
+    
+    my $r1 = 0.95;
+    my $r0 = 0.91;
+    my $space = 0.01;
+    my $radius = 0.04;
+    
+    open(CONF, ">$conf") or die "##### AN ERROR has occurred: could not write to $conf\n";
+
+    print CONF "<<include etc/colors_fonts_patterns.conf>>\n";
+    print CONF "<<include example/etc/ideogram.conf>>\n";
+    print CONF "<<include example/etc/ticks.conf>>\n";
+    print CONF "<image>\n\t<<include etc/image.conf>>\n</image>\n\n";
+    print CONF "chromosomes_units = 1000000\n";
+    print CONF "chromosomes_display_default = no\n";
+    print CONF "chromosomes = $chroms\n";
+    print CONF "karyotype = data/karyotype/karyotype.human.txt\n";
+    print CONF "<plots>\n";
+    
+    foreach my $c (@circos){
+        print CONF "\t<plot>\n";
+        print CONF "\t\ttype = heatmap\n";
+        print CONF "\t\tfile = $c\n";
+        print CONF ("\t\tr1 = " . $r0 . "r\n");
+        print CONF ("\t\tr0 = " . $r1 . "r\n");
+        print CONF "\t\tcolor = blues-9-seq-rev,reds-9-seq\n";
+        print CONF "\t\tstroke_thickness = 0\n";
+        print CONF "\t\tmin = 0\n";
+        print CONF "\t\tmax = 1\n";
+        print CONF "\t</plot>\n";
+        
+        $r1 = $r0-$space;
+        $r0 = $r1-$radius;
+        
+        my $cpfile = File::Spec->catpath($vol, $circo_path, $c);
+        $call = "cp $cpfile .";
+        $ret = system ($call);
+        if ($ret != 0){
+            die "##### AN ERROR has occurred: Could copy $cpfile\n";
+        }
+    }
+    
+    print CONF "</plots>\n\n";
+    print CONF "<<include etc/housekeeping.conf>>\n";
+    
+    $call = "$circo_exec -conf $conf";
+    $ret = system ($call);
+    if ($ret != 0){
+        die "##### AN ERROR has occurred: Could run $circo_exec -conf $conf\n";
+    }
+    
+    $call = "cp $conf .";
+    $ret = system ($call);
+    if ($ret != 0){
+        die "##### AN ERROR has occurred: Could not copy $conf\n";
+    }
+}
+
+# -----------------------------------------------------------------------------
+# FUNCTIONS
+
+sub call{
+    my ($sub_call) = @_;
+        
+    $ret = system ($sub_call);
+    
+    if ($ret != 0){
+        die "##### AN ERROR has occurred\n";
+    }
+}
+
+sub prettyTime{
+    my @months      = qw(Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec);
+    my @weekDays    = qw(Sun Mon Tue Wed Thu Fri Sat Sun);
+    my ($second, $minute, $hour, $dayOfMonth, $month, $yearOffset, $dayOfWeek, $dayOfYear, $daylightSavings) = localtime();
+    my $year        = 1900 + $yearOffset;
+    return "\t$weekDays[$dayOfWeek] $months[$month] $dayOfMonth, $hour:$minute:$second, $year\t";
+}

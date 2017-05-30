@@ -1,0 +1,288 @@
+#!/usr/bin/env perl
+
+use strict;
+use warnings;
+
+use Getopt::Long;
+use File::Spec;
+use File::Path qw(make_path remove_tree);
+use File::Basename;
+
+# -----------------------------------------------------------------------------
+# Variables
+
+my ($USAGE, $OUT_LOG, $help, $log_file, $ret, $call, $in, $out, $path);
+my ($metilene, $threads, $max_dist, $min_cpgs, $method, $min_diff, $predef_reg, $min_id1, $min_id2, $valley, $id1, $id2, $p_val, $DMR_in, $length);
+my ($full_out, $pval_out);
+my $SCRIPTNAME = basename($0);
+my $VERSION    = "v0.1";
+
+# -----------------------------------------------------------------------------
+# OPTIONS
+
+$USAGE = << "USE";
+
+    usage:  perl $SCRIPTNAME  -q <query_file> [--DMR_in] [-o <path_prefix>] [-p  <number>] [-c <number>] [-d <number>] [-l <number>] [--caller <executable>] [-M <number>] [-t <number>] [-f <number>] [-a <string>] [-b <string>] [-B <string>] [-X <string>] [-Y <string>] [-v <number>]
+    
+    [INPUT]     -q          path/filename of metilene input or DMR caller output (set --DMR_in flag, if DMR caller output)
+                --DMR_in    flag, if DMR caller output is provided. Columns must match metilene output columns (chr start end pval diff_methyl nr_cpgs ...). Filter active for -p, -c, -d and -l option.
+                -o          path/prefix of output files (default: input_path/)
+                -p          maximum (<) adj. p-value (q-value) for output of significant DMRs (default: 0.05)
+                -c          minimum (>=) cpgs (default:10)
+                -d          minimum mean methylation difference (>=) (default:0.1)
+                -l          minimum length of DMR [nt] (>=) (post-processing, default: 0)              
+                --caller    path/filename of calller executable (metilene.x). (default in PATH)
+                -M          maximum distance (default:500)
+                -t          number of threads (default:1)
+                -f          number of method (default:1)
+                -a          name of group A (default:"case")
+                -b          name of group B (default:"control")
+                -r          bed-file for predefined region DMR calculation (default:none)
+                -X          minimal number of values in group A (default: all)
+                -Y          minimal number of values in group B (default: all)
+                -v          valley filter (0.0 - 1.0) (default:0.7)
+USE
+
+if (!@ARGV) {
+    printf STDERR $USAGE;
+    exit -1;
+}
+
+unless (GetOptions(
+    "q=s"       => \$in,
+    "DMR_in"    => \$DMR_in,
+    "o=s"       => \$out,
+    "p=s"       => \$p_val,
+    "c=s"       => \$min_cpgs,
+    "d=s"       => \$min_diff,
+    "l=s"       => \$length,    
+    "caller=s"  => \$metilene,
+    "M=s"       => \$max_dist,
+    "t=s"       => \$threads,
+    "f=s"       => \$method,
+    "a=s"       => \$id1,
+    "b=s"       => \$id2,
+    "r=s"       => \$predef_reg,
+    "X=s"       => \$min_id1,
+    "Y=s"       => \$min_id2,
+    "v=s"       => \$valley,
+    "h|help"    => \$help
+)){
+    printf STDERR $USAGE;
+    exit -1;
+}
+if (defined $help){
+    printf STDERR $USAGE;
+    exit -1;
+}
+
+# -----------------------------------------------------------------------------
+# MAIN
+## script name and version
+print STDERR ("[INFO]" . prettyTime() . "$SCRIPTNAME $VERSION started\n");
+
+#################
+## check flags ##
+#################
+print STDERR ("[INFO]" . prettyTime() . "Checking flags\n");
+
+## relative to absolut path ##
+if (defined $in){$in = File::Spec->rel2abs($in)};
+if (defined $out){$out = File::Spec->rel2abs($out)};
+if (defined $metilene){$metilene = File::Spec->rel2abs($metilene);}
+if (defined $predef_reg){$predef_reg = File::Spec->rel2abs($predef_reg)};
+
+
+## out dir
+my ($vol, $dir, $file) = File::Spec->splitpath($in);
+if (!defined $out){
+    $path = $dir;
+}
+else {
+    ($vol, $dir, $file) = File::Spec->splitpath($out);
+    $path = $dir;
+}
+unless (-e $path){
+    $ret = make_path($path);
+    if ($ret != 1){
+        die "##### AN ERROR has occurred: Could not make out directory $path\n";
+    }
+    else{
+        print STDERR  ("[INFO]" . prettyTime() . "Created result-directory $path\n");
+    }
+}
+elsif (-d $path){
+    unless (-w $path && -r $path){
+        die "##### AN ERROR has occurred: out directory $path not readable or writable\n";
+    }
+}
+
+if (!defined $DMR_in) {
+    ## metilene executable ##
+    if (defined $metilene){
+        if (-e $metilene){
+            unless (-d $metilene){
+                unless (-x $metilene){
+                    die "##### AN ERROR has occurred: --caller option executable is not executable\n";
+                }
+            }
+            else{
+                die "##### AN ERROR has occurred: --caller option executable is directory\n";
+            }
+        }
+        else{
+            die "##### AN ERROR has occurred: --caller option executable nonexistent\n";
+        }
+    }
+    else{
+        $metilene  = "metilene.x";
+        $call   = "command -v $metilene >/dev/null 2>&1";
+        $ret    = system ($call);
+        if ($ret != 0){
+            die "##### AN ERROR has occurred: No metilene executable (metilene.x) found. Please provide path/filename of metilene executable with --caller option\n";
+        }
+    }
+    
+    ## max dist ##
+    if (!defined $max_dist){
+        $max_dist = 500;
+    }
+        
+    ## threads ##
+    if (!defined $threads){
+        $threads = 1;
+    }
+    
+    ## method ##
+    if (!defined $method){
+        $method = 1;
+    }
+    
+    ## id group 1 ##
+    if (!defined $id1){
+        $id1 = "case";
+    }
+    
+    ## id group 2 ##
+    if (!defined $id2){
+        $id2 = "control";
+    }
+    
+    ## valley filter ##
+    if (!defined $valley){
+        $valley = 0.7;
+    }
+}
+
+## min cpgs ##
+if (!defined $min_cpgs){
+    $min_cpgs = 10;
+}
+
+## min diff ##
+if (!defined $min_diff){
+    $min_diff = 0.1;
+}
+
+## pval filter ##
+if (!defined $p_val){
+    $p_val = 0.05;
+}
+
+## length ##
+if (!defined $length){
+    $length = 0;
+}
+
+## log file ##
+$log_file = File::Spec->catpath($vol, $path, $file);
+$log_file = ($log_file . ".log");
+
+## out file ##
+$full_out = File::Spec->catpath($vol, $path, $file);
+$full_out = ($full_out . ".full.bed");
+$pval_out = File::Spec->catpath($vol, $path, $file);
+$pval_out = ($pval_out . "_pval." . $p_val . ".bed");
+
+
+
+open($OUT_LOG, ">$log_file") or die "##### AN ERROR has occurred: could not open $log_file!\n";
+
+####################
+### call metilene ##
+####################
+if (!defined $DMR_in) {
+    print STDERR ("[INFO]" . prettyTime() . "Start DMR calling\n");
+    print $OUT_LOG ("[INFO]" . prettyTime() . "Start DMR calling\n");
+    
+    $call = "$metilene -M $max_dist -m $min_cpgs -d $min_diff -t $threads -f $method -a $id1 -b $id2 -v $valley";
+    if (defined $predef_reg) {
+        $call = ($call . " -B $predef_reg");
+    }
+    if (defined $min_id1) {
+        $call = ($call . " -X $min_id1");
+    }
+    if (defined $min_id2) {
+        $call = ($call . " -Y $min_id2");
+    }
+    $call = ($call . " $in >$full_out 2>> $log_file");
+    call($call);
+}
+else {
+    $full_out = $in;
+}
+
+##################
+### filter DMRs ##
+##################
+print STDERR ("[INFO]" . prettyTime() . "Filter DMRs\n");
+print $OUT_LOG ("[INFO]" . prettyTime() . "Filter DMRs\n");
+
+my $count = 0;
+open(OUT, ">$pval_out") or die "##### AN ERROR has occurred: could not write to $pval_out\n";
+open (IN, "$full_out") || die "cannot open $full_out\n";
+    while (<IN>) {
+    chomp;
+    
+    my ($chr, $start, $end, $pval, $diff_methyl, $nr_cpgs) = split(/\t/,$_);
+    if (($pval < $p_val) && (abs($diff_methyl) >= $min_diff) && ($nr_cpgs >= $min_cpgs) && (($end-$start) >= $length)) {
+        print OUT "$chr\t$start\t$end\t$pval\t$diff_methyl\t$nr_cpgs\n";
+        $count++;
+    }
+}
+close (IN);
+close (OUT);
+print STDERR ("[INFO]" . prettyTime() . "Wrote $count DMRs with adj. p-value<$p_val, a minimum absolute difference>=$min_diff, a minimum length [positions with methyl. rate]>=$min_cpgs and a minimum length [nt]>=$length\n");
+print $OUT_LOG ("[INFO]" . prettyTime() . "Wrote $count DMRs with adj. p-value<$p_val, a minimum absolute difference>=$min_diff, a minimum length [positions with methyl. rate]>=$min_cpgs and a minimum length [nt]>=$length\n");
+
+
+
+close ($OUT_LOG);
+
+# -----------------------------------------------------------------------------ls
+# FUNCTIONS
+
+sub call{
+    my ($sub_call) = @_;
+
+    print $OUT_LOG ("[SYSTEM CALL] " . prettyTime() . " " . $sub_call . "\n");
+
+    $ret = system ($sub_call);
+    print $OUT_LOG ("\n");
+
+    if ($ret != 0){
+        print $OUT_LOG ("ERROR in last command\n");
+        die "##### AN ERROR has occurred: Please view the log file\n";
+    }
+}
+
+sub prettyTime{
+    my @months      = qw(Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec);
+    my @weekDays    = qw(Sun Mon Tue Wed Thu Fri Sat Sun);
+    my ($second, $minute, $hour, $dayOfMonth, $month, $yearOffset, $dayOfWeek, $dayOfYear, $daylightSavings) = localtime();
+    my $year        = 1900 + $yearOffset;
+    return "\t$weekDays[$dayOfWeek] $months[$month] $dayOfMonth, $hour:$minute:$second, $year\t";
+}
+
+
+

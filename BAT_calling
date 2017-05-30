@@ -1,0 +1,252 @@
+#!/usr/bin/env perl
+
+use strict;
+use warnings;
+
+use Getopt::Long;
+use File::Spec;
+use File::Path qw(make_path remove_tree);
+use File::Basename;
+
+# -----------------------------------------------------------------------------
+# Variables
+
+my ($USAGE, $OUT_LOG, $help, $log_file, $sam_index, $ret, $call, $vcf, $out);
+my ($genome, $sam, $haarz, $samtools);
+my $SCRIPTNAME = basename($0);
+my $VERSION    = "v0.1";
+
+# -----------------------------------------------------------------------------
+# OPTIONS
+
+$USAGE = << "USE";
+
+    usage:  perl $SCRIPTNAME  -d <string> -q <string> [-i <string>] [--haarz <string>] [--samtools <string>] [-o <string>]
+    [INPUT]     -d          path/filename of reference genome fasta
+                -q          path/filename of query sequences (BAM (path/query_prefix.bam) or gzipped SAM file (path/query_prefix.sam.gz))
+                --haarz     path/filename of haarz executable (default: in PATH)
+                --samtools  path/filename of samtools (default: installed)
+                -o          path for outfiles (default: query_path)
+USE
+
+if (!@ARGV) {
+    printf STDERR $USAGE;
+    exit -1;
+}
+
+unless (GetOptions(
+    "d=s"           => \$genome,
+    "q=s"           => \$sam,
+    "haarz=s"       => \$haarz,
+    "samtools=s"    => \$samtools,
+    "o=s"           => \$out,
+    "h|help"        => \$help
+)){
+    printf STDERR $USAGE;
+    exit -1;
+}
+if (defined $help){
+    printf STDERR $USAGE;
+    exit -1;
+}
+
+# -----------------------------------------------------------------------------
+# MAIN
+## script name and version
+print STDERR ("[INFO]" . prettyTime() . "$SCRIPTNAME $VERSION started\n");
+
+#################
+## check flags ##
+#################
+print STDERR ("[INFO]" . prettyTime() . "Checking flags\n");
+
+## relative to absolut path ##
+if (defined $genome){$genome = File::Spec->rel2abs($genome)};
+if (defined $sam){$sam = File::Spec->rel2abs($sam);}
+if (defined $haarz){$haarz = File::Spec->rel2abs($haarz);}
+if (defined $samtools){$samtools = File::Spec->rel2abs($samtools);}
+if (defined $out){$out = File::Spec->rel2abs($out);}
+
+## out dir
+my ($vol, $dir, $file) = File::Spec->splitpath($sam);
+if (!defined $out){
+    $out = $dir;
+}
+unless (-e $out){
+    $ret = make_path($out);
+    if ($ret != 1){
+        die "##### AN ERROR has occurred: Could not make out directory $out\n";
+    }
+    else{
+        print STDERR  ("[INFO]" . prettyTime() . "Created result-directory $out\n");
+    }
+}
+elsif (-d $out){
+    unless (-w $out && -r $out){
+        die "##### AN ERROR has occurred: out directory $out not readable or writable\n";
+    }  
+}
+
+## segemehl executable ##
+if (defined $haarz){
+    if (-e $haarz){
+        unless (-d $haarz){
+            unless (-x $haarz){
+                die "##### AN ERROR has occurred: --haarz option executable is not executable\n";
+            }
+        }
+        else{
+            die "##### AN ERROR has occurred: --haarz option executable is directory\n";
+        }
+    }
+    else{
+        die "##### AN ERROR has occurred: --haarz option executable nonexistent\n";
+    }
+}
+else{
+    $haarz  = "haarz.x";
+    $call   = "command -v $haarz >/dev/null 2>&1";
+    $ret    = system ($call);
+    if ($ret != 0){
+        die "##### AN ERROR has occurred: No haarz executable found. Please provide path/filename of haarz executable with --haarz option\n";
+    }
+}
+
+## samtools ##
+if (defined $samtools){
+    if (-e $samtools){
+        unless (-d $samtools){
+            unless (-x $samtools){
+                die "##### AN ERROR has occurred: --samtools option executable is not executable\n";
+            }
+        }
+        else{
+            die "##### AN ERROR has occurred: --samtools option executable is directory\n";
+        }
+    }
+    else{
+        die "##### AN ERROR has occurred: --samtools option executable nonexistent\n";
+    }
+}
+else{
+    $samtools = "samtools";
+}
+$call = "command -v $samtools > /dev/null 2>&1";
+$ret = system ($call);
+if ($ret != 0){
+    die "##### AN ERROR has occurred: No samtools executable found. Please provide path/filename of samtools executable with --samtools option\n";
+}
+
+## genome ##
+if ((defined $genome) && (-e $genome)){
+    unless (-r $genome){
+        die "##### AN ERROR has occurred: genome (option -d) not readable\n";
+    }
+}
+else{
+    printf STDERR $USAGE;
+    die "##### AN ERROR has occurred: required option -d missing or nonexistent\n";
+}
+
+## query ##
+if ((defined $sam) && (-e $sam)){
+    unless (-r $sam){
+        die "##### AN ERROR has occurred: query (option -q) not readable\n";
+    }
+}
+else {
+    printf STDERR $USAGE;
+    die "##### AN ERROR has occurred: required option -q missing or nonexistent\n";
+}
+
+## log file ##
+$log_file = File::Spec->catpath($vol, $out, $file);
+if ($file =~ m/.sam.gz$/){
+    $log_file =~ s/.sam.gz$/.calling.log/;
+}
+elsif ($file =~ m/.bam$/){
+    $log_file =~ s/.bam$/.calling.log/;
+}
+else {
+    die "##### AN ERROR has occurred: required option -q is no BAM file (prefix.bam) or gzipped SAM file (prefix.sam.gz)\n";
+}
+open($OUT_LOG, ">$log_file") or die "##### AN ERROR has occurred: could not open $log_file!\n";
+
+
+##########################
+## possibly build index ##
+## and bam to sam.gz    ##
+##########################
+$sam_index = $sam;
+if ($sam_index =~ m/.bam$/) {
+    $sam_index =~ s/.bam$/.sam.idx/;
+}
+elsif ($sam_index =~ m/.sam.gz$/) {
+    $sam_index =~ s/.sam.gz$/.sam.idx/;
+}
+
+if ($sam =~ m/.bam$/){
+    print STDERR  ("[INFO]" . prettyTime() . "Convert BAM to gzipped SAM\n");
+    print $OUT_LOG  ("[INFO]" . prettyTime() . "Convert BAM to gezipped SAM\n");
+    my $tmp = $sam;
+    $sam =~ s/.bam/.sam.gz/;
+    $call = "$samtools view -h $tmp 2>> $log_file | gzip -c > $sam 2>> $log_file";
+    call($call);
+}
+
+if (!(-e $sam_index)) {
+    print STDERR  ("[INFO]" . prettyTime() . "Build query index\n");
+    print $OUT_LOG  ("[INFO]" . prettyTime() . "Build query index\n");
+    $call = "$haarz -x $sam_index -d $genome -q $sam >> $log_file 2>&1";
+    call($call);
+}
+
+
+## vcf file ##
+$vcf = File::Spec->catpath($vol, $out, $file);
+if ($vcf =~ m/.bam$/){
+    $vcf =~ s/.bam$/.vcf.gz/;
+}
+else {
+    $vcf =~ s/.sam.gz$/.vcf.gz/;
+}
+
+
+#################
+### call haarz ##
+#################
+print STDERR ("[INFO]" . prettyTime() . "Start methylation calling (time intense step)\n");
+print $OUT_LOG ("[INFO]" . prettyTime() . "Start methylation calling\n");
+
+$call = "$haarz -d $genome -q $sam -i $sam_index -B 2>> $log_file | gzip -c > $vcf 2>> $log_file";
+call($call);
+
+close ($OUT_LOG);
+
+# -----------------------------------------------------------------------------ls 
+# FUNCTIONS
+
+sub call{
+    my ($sub_call) = @_;
+    
+    print $OUT_LOG ("[SYSTEM CALL] " . prettyTime() . " " . $sub_call . "\n");
+    
+    $ret = system ($sub_call);
+    print $OUT_LOG ("\n");
+    
+    if ($ret != 0){
+        print $OUT_LOG ("ERROR in last command\n");
+        die "##### AN ERROR has occurred: Please view the log file\n";
+    }
+}
+
+sub prettyTime{
+    my @months      = qw(Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec);
+    my @weekDays    = qw(Sun Mon Tue Wed Thu Fri Sat Sun);
+    my ($second, $minute, $hour, $dayOfMonth, $month, $yearOffset, $dayOfWeek, $dayOfYear, $daylightSavings) = localtime();
+    my $year        = 1900 + $yearOffset;
+    return "\t$weekDays[$dayOfWeek] $months[$month] $dayOfMonth, $hour:$minute:$second, $year\t";
+}
+
+
+

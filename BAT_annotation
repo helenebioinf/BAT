@@ -1,0 +1,213 @@
+#!/usr/bin/env perl
+
+use strict;
+use warnings;
+
+use File::Basename;
+use Getopt::Long;
+use File::Spec;
+use File::Path qw(make_path);
+use File::Temp qw/ tempfile tempdir /;
+
+# -----------------------------------------------------------------------------
+# Variables
+
+my ($USAGE, $call, $help, $ret, $bed, $methyl, $out, $bedtools, $group, $R);
+my ($volume, $dir, $file);
+my (@groups);
+my $SCRIPTNAME = basename($0);
+my $VERSION    = "v0.1";
+
+# -----------------------------------------------------------------------------
+# OPTIONS
+
+$USAGE = << "USE";
+
+    usage:  perl $SCRIPTNAME -b <string> -i <string> --groups <string> [-o <string>] [-R <string>] [--bedtools <string>]
+  
+    [INPUT]     -b          bedgraph file containing annotation of regions, e.g. TFBS, hypo/hypermethylated regions, genes, CpG islands/shores (format: chr<tab>start<tab>end<tab>unique_identifier<tab>grouping_label)
+                -i          path/filename of input file (summary file) (format: chr<tab>start<tab>end<tab>sample1<tab>sample2<tab>...<tab>samplen)
+		--groups    comma-separated identifiers of the two groups, (default g1,g2)
+    [GENERAL]   -o          path/prefix for output
+                --bedtools  path/executable of bedtools (default in PATH)
+                -R          path/executable of R (default in PATH)
+
+USE
+
+unless (GetOptions(
+    "b=s"   	=> \$bed,
+    "i=s"   	=> \$methyl,
+    "groups=s"	=> \$group,
+    "o=s"   	=> \$out,
+    "bedtools=s"=> \$bedtools,
+    "R=s" 		=> \$R,
+    "h|help"    => \$help
+)){
+    printf STDERR $USAGE;
+    exit -1;
+}
+if (defined $help){
+    printf STDERR $USAGE;
+    exit -1;
+}
+
+# -----------------------------------------------------------------------------
+# MAIN
+## script name and version
+print STDERR ("[INFO]" . prettyTime() . "$SCRIPTNAME $VERSION started\n");
+
+############
+## checks ##
+############
+print STDERR ("[INFO]" . prettyTime() . "Checking input\n");
+
+if ((!defined $bed) || (!defined $methyl) || (!defined $out)) {
+  printf STDERR $USAGE;
+  print "##### AN ERROR has occurred: Please provide -b, -i and -o option\n";
+  exit -1;
+}
+
+if (!defined $group) {
+	$group = ("g1,g2");
+}
+
+$dir = File::Spec->curdir();
+
+if (defined $bedtools){
+  $bedtools = File::Spec->rel2abs($bedtools);
+  if (-e $bedtools){
+    unless (-d $bedtools){
+	unless (-x $bedtools){
+	die "##### AN ERROR has occurred: --bedtools option executable is not executable\n";
+      }
+    }
+    else{
+      die "##### AN ERROR has occurred: --bedtools option executable is directory\n";
+    }
+  }
+  else{
+    die "##### AN ERROR has occurred: --bedtools option executable ($bedtools) nonexistent\n";
+  }
+}
+else{
+  $bedtools = "bedtools";
+}
+$call = "command -v $bedtools > /dev/null 2>&1";
+$ret = system ($call);
+if ($ret != 0){
+  die "##### AN ERROR has occurred: No bedtools executable found. Please provide path/filename of bedtools executable with --bedtools option\n";
+}
+
+if (defined $R){
+  $R = File::Spec->rel2abs($R);
+  if (-e $R){
+    unless (-d $R){
+	unless (-x $R){
+	die "##### AN ERROR has occurred: -R option executable is not executable\n";
+      }
+    }
+    else{
+      die "##### AN ERROR has occurred: -R option executable is directory\n";
+    }
+  }
+  else{
+    die "##### AN ERROR has occurred: -R option executable ($R) nonexistent\n";
+  }
+}
+else{
+  $R = "R";
+}
+$call = "command -v $R > /dev/null 2>&1";
+$ret = system ($call);
+if ($ret != 0){
+  die "##### AN ERROR has occurred: No R executable found. Please provide path/filename of R executable with -R option\n";
+}
+
+if (defined $bed) {$bed = File::Spec->rel2abs($bed)};
+if ((defined $bed) && (-e $bed)){
+  unless (-r $bed){
+    die "##### AN ERROR has occurred: required annotation file (option -b) not readable\n";
+  }
+}
+else{
+  die "##### AN ERROR has occurred: required annotation file (option -b) missing or nonexistent\n";
+}
+
+if (defined $methyl) {$methyl = File::Spec->rel2abs($methyl)};
+if ((defined $methyl) && (-e $methyl)){
+  unless (-r $methyl){
+    die "##### AN ERROR has occurred: required methylation list file (option -i) not readable\n";
+  }
+}
+else{
+  die "##### AN ERROR has occurred: required methylation list file (option -i) missing or nonexistent\n";
+}
+
+
+#################
+#### R input ####
+#################
+print STDERR ("[INFO]" . prettyTime() . "Intersecting annotation and methylation rates\n");
+
+my $tmpdir = tempdir( CLEANUP =>  1 );
+my $template = 'annotation_XXXXX';
+my ($R_IN, $R_file) = tempfile($template, DIR => $tmpdir, SUFFIX => ".Rinput", UNLINK => 1);
+
+open(INtmp, "head -1 $methyl | cut -f4- | ") or die "Error in input $methyl\n";
+while(<INtmp>){
+	chomp;
+    @groups = split(/\t/,$_);
+}
+close(INtmp);
+
+my @cols	= (6..(scalar(@groups)+5));
+my $col		= join(",", @cols);
+my @ops		= ("mean") x scalar(@groups);
+my $op		= join(",", @ops);
+
+print $R_IN "chr\tstart\tend\tidentifier\titem\tcount\t";
+$call = "head -1 $methyl | cut -f4- >>$R_file";
+$ret  = system ($call); 
+if ($ret != 0){
+  die "##### AN ERROR has occurred: Problem with $methyl\n";
+}
+
+$call = "$bedtools intersect -wa -wb -a $bed -b $methyl | cut -f1-5,9- | sort -V | $bedtools groupby -g 1,2,3,4,5 -c 6,$col -o count,$op >>$R_file";
+$ret  = system ($call); 
+if ($ret != 0){
+  die "##### AN ERROR has occurred: Problem with $bed or $methyl\n";
+}
+close ($R_IN);
+
+#################
+#### R plots ####
+#################
+print STDERR ("[INFO]" . prettyTime() . "Plotting annotation items\n");
+
+my $Rscript = ($R . "script");
+my $plot_script	= File::Spec->rel2abs($0);
+$plot_script	= ($plot_script . ".R");
+
+$call = "$Rscript $plot_script -i $R_file -o $out -p $group 2>&1 >/dev/null";
+$ret  = system ($call); 
+if ($ret != 0){
+  die "##### AN ERROR has occurred: Problem with plotting\n";
+}
+
+$call = "rm $R_file";
+$ret  = system ($call); 
+if ($ret != 0){
+  print "##### AN ERROR has occurred: could not remove $R_file\n";
+}
+
+
+# -----------------------------------------------------------------------------
+# FUNCTIONS
+
+sub prettyTime{
+  my @months      = qw(Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec);
+  my @weekDays    = qw(Sun Mon Tue Wed Thu Fri Sat Sun);
+  my ($second, $minute, $hour, $dayOfMonth, $month, $yearOffset, $dayOfWeek, $dayOfYear, $daylightSavings) = localtime();
+  my $year        = 1900 + $yearOffset;
+  return "\t$weekDays[$dayOfWeek] $months[$month] $dayOfMonth, $hour:$minute:$second, $year\t";
+}

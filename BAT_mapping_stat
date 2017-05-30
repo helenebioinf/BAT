@@ -1,0 +1,596 @@
+#!/usr/bin/env perl
+
+use strict;
+use warnings;
+
+use Getopt::Long;
+use List::Util qw(max);
+use Math::Round qw(nearest);
+use File::Basename;
+use File::Spec;
+
+# -----------------------------------------------------------------------------
+# VARIABLES
+
+use vars qw ($USAGE $help $IN $OUT_P $OUT_M $OUT_S $OUT_E $OUT_X $R $bam $excluded $mate $fastq $call $ret $pdf);
+use vars qw ($out_paired_freq $out_mate_freq $out_single_freq $out_edist $out_split $nr_reads);
+use vars qw (%mapping_freq_paired %mapping_freq_mate %mapping_freq_single);
+use vars qw (%edist);
+use vars qw ($NM $NH $XF $XB $XQ $XL $XR);
+use vars qw ($qname $flag $rname $pos $mapq $cigar $mname $mpos $isize $seq $qual @tags);
+use vars qw ($p_unique_paired $p_multiple_paired $p_unique_mate $p_multiple_mate $p_unique_single $p_multiple_single $p_sum_reads $p_sum_frag);
+
+
+my ($unique_paired, $multiple_paired, $unique_mate, $multiple_mate, $unique_single, $multiple_single, $nr_mappings) = (0)x10;
+my $NM_out = "WARNING: No NM tag -> no edistance distribution will be calculated!!!\n";
+my $SCRIPTNAME = basename($0);
+my $VERSION    = "v0.1";
+
+# -----------------------------------------------------------------------------
+# OPTIONS
+
+$USAGE = << "USE";
+
+  usage:  perl $SCRIPTNAME --bam <string> --excluded <string> [-R <string>] [-p <string>] [-m <string>] [-s <string>] [-e <string>] [--fastq <string>]
+
+  options:  --bam   Path to input bam file (default: stdin)
+            --excluded Path to input excluded bam file
+            -p      Path to output file for multiple hits frequencies paired end (default: stdout)
+            -m      Path to output file for multiple hits frequencies one mate (default: stdout)
+            -s      Path to output file for multiple hits frequencies single ends (default: stdout)
+            -e      Path to output file for e-distance distribution (default: stdout)
+            --fastq Path to fastq file (first read pair if paired end)
+            -R      path/executable of R (default in PATH)
+  Plots for statistics will be produced if R available (name of input bam . pdf or statistics.pdf if no bam input is given).
+  
+  input:    (1a) bam file
+                perl $SCRIPTNAME --bam xxx.bam --excluded xxx.excluded.bam
+                
+                or
+                
+            (1b) sam format input by stdin generated with samtools view
+                samtools view xxx.bam | perl $SCRIPTNAME --excluded xxx.excluded.bam
+
+  output:   stdout
+            (0) total amount of mappings
+            (1) total amount of reads in fastq file (if present)
+            (2) mapped reads:
+                number of mapped reads, seperated by both ends of a pair
+                are mapped once (unique paired ends) or multiple times
+                (multiple paired ends) and only one end of a pair mapped
+                once (unique one mate) or multiple times (multiple
+                one mate) and a single end read mapped once (unique
+                single end) or multiple times (multiple single end)
+            (3) sum of all mapped reads and if paired ends sum of all
+                mapped fragments
+            
+            stdout or provided files
+            (4) frequencies of the multiple hits seperated by paired end
+                reads and mate pairs and single end reads
+                Format: nr of hits<tab>frequency
+            (5) frequencies of the e-distances of the reads
+                e-distance of ALL (not split) reads is count!
+                Format: e-distance<tab>frequency
+                
+USE
+
+if ((!@ARGV)  && (-t STDIN)) {
+    printf STDERR $USAGE;
+    exit -1;
+}
+
+unless (GetOptions(
+    "bam=s"   => \$bam,
+    "excluded=s" => \$excluded,
+    "p=s"     => \$out_paired_freq,
+    "m=s"     => \$out_mate_freq,
+    "s=s"     => \$out_single_freq,
+    "e=s"     => \$out_edist,
+    "fastq=s" => \$fastq,
+    "R=s"     => \$R,
+    "h|help"  => \$help
+)){
+    printf STDERR $USAGE;
+    exit -1;
+}
+if (defined $help){
+    printf STDERR $USAGE;
+    exit -1;
+}
+
+# -----------------------------------------------------------------------------
+# MAIN
+## script name and version
+print STDERR ("[INFO]" . prettyTime() . "$SCRIPTNAME $VERSION started\n");
+
+if (defined $R){
+  $R = File::Spec->rel2abs($R);
+  if (-e $R){
+    unless (-d $R){
+	unless (-x $R){
+	die "##### AN ERROR has occurred: -R option executable is not executable\n";
+      }
+    }
+    else{
+      die "##### AN ERROR has occurred: -R option executable is directory\n";
+    }
+  }
+  else{
+    die "##### AN ERROR has occurred: -R option executable ($R) nonexistent\n";
+  }
+}
+else{
+  $R = "R";
+}
+
+$call = "command -v $R &> /dev/null";
+$ret = system ($call);
+if ($ret != 0){
+    print "##### WARNING: No R executable found. No statistic figures will be produced. Please provide path/filename of R executable with -R option for figures.\n";
+    undef $R;
+}
+
+
+## if input bam okay, open stream
+if (!defined $bam && -t STDIN){
+    printf STDERR $USAGE;
+    print "##### AN ERROR has occurred: Please provide bam file (--bam option)\n";
+    exit -1;
+}
+elsif (defined $bam){
+    $bam = File::Spec->rel2abs($bam);
+    if (-e $bam){
+        unless (-r $bam){
+            die "##### AN ERROR has occurred: $bam (option --bam) not readable\n";
+        }
+    }
+    $pdf = $bam;
+    $pdf =~ s/.bam$/.pdf/;
+}
+else{
+    $IN = \*STDIN;
+    $pdf = "statistics.pdf";
+}
+
+## if input excluded okay, open stream
+if (!defined $excluded){
+    printf STDERR $USAGE;
+    print "##### AN ERROR has occurred: Please provide excluded bam file (--excluded option)\n";
+    exit -1;
+}
+elsif (defined $excluded){
+    $excluded = File::Spec->rel2abs($excluded);
+    if (-e $excluded){
+        unless (-r $excluded){
+            die "##### AN ERROR has occurred: $excluded (option --excluded) not readable\n";
+        }
+    }
+}
+
+## count reads in fastq file
+if (defined $fastq) {
+    if (-e $fastq) {
+        printf STDERR ("[INFO]" . prettyTime() . "Counting reads in fastq\n");
+        $nr_reads = `zcat $fastq | wc -l`;
+        $nr_reads = $nr_reads/4;
+        
+        if ($nr_reads == 0) {
+            die "##### AN ERROR has occurred: there are no reads in $fastq\n";
+        }
+        else {
+            printf STDERR ("[INFO]" . prettyTime() . "$fastq contains $nr_reads reads.\n");
+        }
+    }
+    else {
+        die "##### AN ERROR has occurred: fastq file $fastq (option --fastq) not nonexistent\n";
+    }
+}
+
+## process input files
+for (my $f=0; $f<=1; $f++){
+    if ($f==0) {
+        if (defined $bam){
+            open($IN, "samtools view $bam | ") or die "Error in input $bam\n";
+            printf STDERR ("[INFO]" . prettyTime() . "Processing input file $bam\n");
+        }
+    }
+    elsif ($f==1) {
+        open($IN, "samtools view $excluded | ") or die "Error in excluded bam $excluded\n";
+        printf STDERR ("[INFO]" . prettyTime() . "Processing excluded input file $excluded\n");
+    }
+    
+    while(<$IN>){
+        chomp;
+        
+        ## get sam information
+        ($qname, $flag, undef $rname, undef $pos, undef $mapq, $cigar, undef $mname, undef $mpos, undef $isize, undef $seq, undef $qual, @tags) = split(/\t/,$_);
+        
+        if ($qname =~ m/^@/){
+            next;
+        }
+        
+        ($NM, $NH, $XF, $XB, $XQ, $XL, $XR) = (undef)x8;
+        
+        ## get tag information
+        foreach (@tags){
+            my $tag = substr($_, 0, 5, "");
+            if ($tag eq "NM:i:"){
+                $NM = $_;           #edist
+            }
+            elsif ($tag eq "NH:i:"){
+                $NH = $_;           #freq
+            }
+            elsif ($tag eq "XF:i:"){
+                $XF = $_;           #nr of bisulfite mismatches
+            }
+            elsif ($tag eq "XB:Z:"){
+                $XB = $_;           #bisulfite mapping
+            }
+            elsif ($tag eq "XQ:i:"){
+                $XQ = $_;           #split read
+            }
+            elsif ($tag eq "XL:i:"){
+                $XL = $_;           #nr of split-fragments
+            }
+            elsif ($tag eq "XR:i:"){
+                $XR = $_;           #file is realigned
+            }
+        }
+        
+        ## check for dependencies
+        if (defined $XR){
+            die "NO realigned files!\nNo XR tag allowed in bisulfite mapping: $_\n";
+        }
+        if ((defined $XL) || (defined $XQ)){
+            die "There are split-reads in bisulfite treated read alignment!\nNo XL tag allowed in bisulfite mapping: $_\n";
+        }
+        
+        if (!defined $XB){
+            die "No XB tag found, although bisulfite mapping: $_\n";
+        }
+        
+        if (!defined $NH){
+            die "There is no mapping frequency information\nNo NH tag found: $_\n";
+        }
+        
+        if (!defined $NM){
+            if ($NM_out ne 'done'){
+                print STDERR ("[INFO]" . prettyTime() . $NM_out);
+                $NM_out = "done";
+            }
+        }
+    
+        ## set mate information
+        if ($flag & 0x4){           #read unmapped
+            die "Unmapped read: $_\n";
+        }
+        elsif ($flag & 0x1){
+            if ($flag & 0x8){
+                $mate = 1;          #only one mate mapped, bislufite: possibly both mates are mapped independently as single mates
+            }
+            elsif (($flag & 0x40) && ($flag & 0x80)){
+                die "Read is first and second in pair: $_\n";
+            }
+            elsif ($flag & 0x40){
+                $mate = 2;          #both ends mapped, first in pair
+            }
+            elsif ($flag & 0x80){
+                $mate = 2;          #both ends mapped, second in pair
+            }
+            else{
+                die "paired-end and not 0x40 or 0x80: $_\n";
+            }
+        }
+        elsif (($flag & 0x40) || ($flag & 0x80)){
+            die "not paired-end but first in pair or second in pair is set: $_\n";
+        }
+        else{
+            $mate = 0;              #single ends
+        }
+        
+        ## count mapping frequency
+        if ($mate == 2){           
+            if (exists $mapping_freq_paired{$NH}){  #paired end
+                $mapping_freq_paired{$NH}++;
+            }
+            else{
+                $mapping_freq_paired{$NH} = 1;
+            }
+        }
+        elsif ($mate == 1){                         #mate
+            if (exists $mapping_freq_mate{$NH}){
+                $mapping_freq_mate{$NH}++;
+            }
+            else{
+                $mapping_freq_mate{$NH} = 1;
+            }
+        }
+        elsif ($mate == 0){                         #single ends
+            if (exists $mapping_freq_single{$NH}){
+                $mapping_freq_single{$NH}++;
+            }
+            else{
+                $mapping_freq_single{$NH} = 1;
+            }
+        }
+        
+        ## count total amount of mappings
+        $nr_mappings++;
+        
+        ## count edists of ALL (not split) reads
+        if (exists $edist{$NM}){
+            $edist{$NM}++;
+        }
+        else{
+            $edist{$NM} = 1;
+        }
+    }
+    
+    ## close streams
+    close($IN);
+}
+
+
+## calculate numbers
+
+## count number of uniquely mapped paired ends
+if (exists $mapping_freq_paired{1}){
+    $unique_paired = ($mapping_freq_paired{1}/2);
+    delete ($mapping_freq_paired{1});
+}
+else{
+    $unique_paired = 0;
+}
+## count number of multiple mapped paired ends
+foreach (keys %mapping_freq_paired){
+    $multiple_paired = ($multiple_paired+($mapping_freq_paired{$_}/(2*$_)));
+}
+
+## count number of uniquely mapped mates
+if (exists $mapping_freq_mate{1}){
+    $unique_mate = $mapping_freq_mate{1};
+    delete ($mapping_freq_mate{1});
+}
+else{
+    $unique_mate = 0;
+}
+## count number of multiple mapped mates
+foreach (keys %mapping_freq_mate){
+    $multiple_mate = ($multiple_mate+($mapping_freq_mate{$_}/$_));
+}
+
+## count number of uniquely mapped single
+if (exists $mapping_freq_single{1}){
+    $unique_single = $mapping_freq_single{1};
+    delete ($mapping_freq_single{1});
+}
+else{
+    $unique_single = 0;
+}
+## count number of multiple mapped single
+foreach (keys %mapping_freq_single){
+    $multiple_single = ($multiple_single+($mapping_freq_single{$_}/$_));
+}
+
+## calculate sums of mapped reads/fragments
+my $sum_reads = $unique_paired+$multiple_paired+$unique_mate+$multiple_mate+$unique_single+$multiple_single;
+my $sum_frag  = (2*$unique_paired)+(2*$multiple_paired)+$unique_mate+$multiple_mate+$unique_single+$multiple_single;
+
+## calc percentages
+if (defined $nr_reads) {
+    $p_unique_paired     = ("(" . nearest(.01, 100*$unique_paired/$nr_reads) . "%)");
+    $p_multiple_paired   = ("(" . nearest(.01, 100*$multiple_paired/$nr_reads) . "%)");
+    $p_unique_mate       = ("(" . nearest(.01, 100*$unique_mate/$nr_reads) . "%)");
+    $p_multiple_mate     = ("(" . nearest(.01, 100*$multiple_mate/$nr_reads) . "%)");
+    $p_unique_single     = ("(" . nearest(.01, 100*$unique_single/$nr_reads) . "%)");
+    $p_multiple_single   = ("(" . nearest(.01, 100*$multiple_single/$nr_reads) . "%)");
+    $p_sum_reads         = ("(" . nearest(.01, 100*$sum_reads/$nr_reads) . "%)");
+    $p_sum_frag          = ("(" . nearest(.01, 100*$sum_frag/(2*$nr_reads)) . "%)");
+}
+else {
+    $p_unique_paired     = "NA%";
+    $p_multiple_paired   = "NA%";
+    $p_unique_mate       = "NA%";
+    $p_multiple_mate     = "NA%";
+    $p_unique_single     = "NA%";
+    $p_multiple_single   = "NA%";
+    $p_sum_reads         = "NA%";
+    $p_sum_frag          = "NA%";
+    $nr_reads            = ".";
+}
+ 
+$unique_paired      = nearest(.01, $unique_paired);
+$multiple_paired    = nearest(.01, $multiple_paired);
+$unique_mate        = nearest(.01, $unique_mate);
+$multiple_mate      = nearest(.01, $multiple_mate);
+$unique_single      = nearest(.01, $unique_single);
+$multiple_single    = nearest(.01, $multiple_single);
+$sum_reads          = nearest(.01, $sum_reads);
+$sum_frag           = nearest(.01, $sum_frag);
+
+
+## print output: number of mapped reads
+print "-----------------------------\n--------   SUMMARY   --------\n-----------------------------\n";
+print "total amount of MAPPINGS:\t$nr_mappings\ntotal amount of query READS:\t$nr_reads\n";
+print "\nMAPPED READS:
+unique paired end:\t$unique_paired $p_unique_paired
+multiple paired end:\t$multiple_paired $p_multiple_paired
+unique one mate:\t$unique_mate $p_unique_mate
+multiple one mate:\t$multiple_mate $p_multiple_mate
+unique single end:\t$unique_single $p_unique_single
+multiple single end:\t$multiple_single $p_multiple_single\n";
+print "sum of mapped reads:\t$sum_reads $p_sum_reads\n";
+if ($sum_reads ne $sum_frag){
+    print "sum of mapped mates:\t$sum_frag\n";
+}
+print "\n-----------------------------\n\n";
+
+
+## print output: mapping frequency for paired end reads
+my @R_map_pair_freq = ();
+my @R_map_pair_val  = ();
+if (defined $out_paired_freq){
+    open($OUT_P, ">$out_paired_freq") or die "Error in output paired end frequencies\n";
+    if (%mapping_freq_paired || $unique_paired){
+        print $OUT_P "paired_frequencies:\nhits\tfrequency\n1\t$unique_paired\n";
+        push(@R_map_pair_val, "1");
+        push(@R_map_pair_freq, $unique_paired);
+    }
+}
+else{
+    $OUT_P = \*STDOUT;
+    if (%mapping_freq_paired || $unique_paired){
+        print $OUT_P "paired_frequencies:\nhits\tfrequency\n1\t$unique_paired\n";
+        push(@R_map_pair_val, "1");
+        push(@R_map_pair_freq, $unique_paired);
+    }
+}
+foreach (sort{$a <=> $b} keys %mapping_freq_paired){
+    my $nr = ($mapping_freq_paired{$_}/(2*$_));
+    print $OUT_P "$_\t$nr\n";
+    push(@R_map_pair_val, $_ );
+    push(@R_map_pair_freq, $nr);
+    
+}
+if (defined $out_paired_freq){
+    close($OUT_P);
+}
+
+## print output: mapping frequency for mates
+my @R_map_mate_freq = ();
+my @R_map_mate_val  = ();
+if (defined $out_mate_freq){
+    open($OUT_M, ">$out_mate_freq") or die "Error in output mate frequencies\n";
+    if (%mapping_freq_mate || $unique_mate){
+        print $OUT_M "\nmate_frequencies:\nhits\tfrequency\n1\t$unique_mate\n";
+        push(@R_map_pair_val, "1");
+        push(@R_map_pair_freq, $unique_mate);
+    }
+}
+else{
+    $OUT_M = \*STDOUT;
+    if (%mapping_freq_mate || $unique_mate){
+        print $OUT_M "\nmate_frequencies:\nhits\tfrequency\n1\t$unique_mate\n";
+        push(@R_map_pair_val, "1");
+        push(@R_map_pair_freq, $unique_mate);
+    }
+}
+foreach (sort{$a <=> $b} keys %mapping_freq_mate){
+    my $nr = ($mapping_freq_mate{$_}/$_);
+    print $OUT_M "$_\t$nr\n";
+    push(@R_map_mate_val, $_ );
+    push(@R_map_mate_freq, $nr);
+}
+if (defined $out_mate_freq){
+    close($OUT_M);
+}
+
+## print output: mapping frequency for single ends
+my @R_single_freq = ();
+my @R_single_val  = ();
+if (defined $out_single_freq){
+    open($OUT_S, ">$out_single_freq") or die "Error in output single frequencies\n";
+    if (%mapping_freq_single || $unique_single){
+        print $OUT_S "\nsingle_frequencies:\nhits\tfrequency\n1\t$unique_single\n";
+        push(@R_single_val, "1");
+        push(@R_single_freq, $unique_single);
+    }
+}
+else{
+    $OUT_S = \*STDOUT;
+    if (%mapping_freq_single || $unique_single){
+        print $OUT_S "\nsingle_frequencies:\nhits\tfrequency\n1\t$unique_single\n";
+        push(@R_single_val, "1");
+        push(@R_single_freq, $unique_single);
+    }
+}
+foreach (sort{$a <=> $b} keys %mapping_freq_single){
+    my $nr = ($mapping_freq_single{$_}/$_);
+    print $OUT_S "$_\t$nr\n";
+    push(@R_single_val, $_ );
+    push(@R_single_freq, $nr);
+}
+if (defined $out_single_freq){
+    close($OUT_S);
+}
+
+## print output: e-distance
+my @R_edist_freq = ();
+my @R_edist_val = ();
+if (defined $out_edist){
+    open($OUT_E, ">$out_edist") or die "Error in output e-distance\n";
+}
+else{
+    $OUT_E = \*STDOUT;
+    if (%edist){
+        print $OUT_E "\ne_distance of mappings:\nedist\tfrequency\n";
+    }
+}
+foreach (sort{$a <=> $b} keys %edist){
+    print $OUT_E "$_\t$edist{$_}\n";
+    push(@R_edist_val, $_ );
+    push(@R_edist_freq, $edist{$_});
+}
+if (defined $out_edist){
+    close($OUT_E);
+}
+
+
+my ($R_map_pair_val, $R_map_pair_freq, $R_map_mate_val, $R_map_mate_freq, $R_single_val, $R_single_freq, $R_edist_val, $R_edist_freq) = ("")x8;
+if ($unique_paired){
+    $R_map_pair_val  = join(",", @R_map_pair_val);
+    $R_map_pair_freq = join(",", @R_map_pair_freq);
+}
+if ($unique_mate){
+    $R_map_mate_val  = join(",", @R_map_mate_val);
+    $R_map_mate_freq = join(",", @R_map_mate_freq);
+}
+if ($unique_single){
+    $R_single_val = join(",", @R_single_val);
+    $R_single_freq = join(",", @R_single_freq);
+}
+$R_edist_val = join(",", @R_edist_val);
+$R_edist_freq = join(",", @R_edist_freq);
+
+## plot statistics
+if (defined $R) {
+    printf STDERR ("[INFO]" . prettyTime() . "Plotting statistics ($pdf)\n");
+    my $plot =
+    "args <- commandArgs(trailingOnly = TRUE)
+    suppressPackageStartupMessages(library('ggplot2'))
+    
+    pair <- data.frame(hits=c($R_map_pair_val), freq=c($R_map_pair_freq))
+    mate <- data.frame(hits=c($R_map_mate_val), freq=c($R_map_mate_freq))
+    single <- data.frame(hits=c($R_single_val), freq=c($R_single_freq))
+    edist <- data.frame(edist=c($R_edist_val), freq=c($R_edist_freq))
+    
+    pdf('$pdf')
+    if (nrow(pair) > 0){
+        ggplot(pair, aes(x=hits, y=freq)) + geom_bar(stat='identity', fill='#009e73') + theme_classic(14) + xlab('#hits per paired end read') + ylab('frequency') + ggtitle('Distribution of mapping frequencies -  pairs') + theme(axis.line.x=element_line(colour='black'), axis.line.y=element_line(colour='black'))
+    }
+    if (nrow(mate) > 0){
+        ggplot(mate, aes(x=hits, y=freq)) + geom_bar(stat='identity', fill='#009e73') + theme_classic(14) + xlab('#hits per single end read') + ylab('frequency') + ggtitle('Distribution of mapping frequencies - single mates') + theme(axis.line.x=element_line(colour='black'), axis.line.y=element_line(colour='black'))
+    }
+    if (nrow(single) > 0){
+        ggplot(single, aes(x=hits, y=freq)) + geom_bar(stat='identity', fill='#009e73') + theme_classic(14) + xlab('#hits per read') + ylab('frequency') + ggtitle('Distribution of mapping frequencies') + theme(axis.line.x=element_line(colour='black'), axis.line.y=element_line(colour='black'))
+    }
+    ggplot(edist, aes(x=edist, y=freq)) + geom_bar(stat='identity', fill='#009e73') + theme_classic(14) + xlab('edit distance') + ylab('frequency') + ggtitle('Distribution of edit distances') + theme(axis.line.x=element_line(colour='black'), axis.line.y=element_line(colour='black'))
+    dev.off()
+    ";
+
+    `echo "$plot" | $R --slave --silent`;
+}
+
+
+# -----------------------------------------------------------------------------
+# FUNCTIONS
+
+sub prettyTime{
+    my @months      = qw(Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec);
+    my @weekDays    = qw(Sun Mon Tue Wed Thu Fri Sat Sun);
+    my ($second, $minute, $hour, $dayOfMonth, $month, $yearOffset, $dayOfWeek, $dayOfYear, $daylightSavings) = localtime();
+    my $year        = 1900 + $yearOffset;
+    return "\t$weekDays[$dayOfWeek] $months[$month] $dayOfMonth, $hour:$minute:$second, $year\t";
+}
+
+
