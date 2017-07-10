@@ -325,6 +325,9 @@ my $Rscript = ($R . "script");
 $call = ("$Rscript $plot_script $pval_out $pdf $id1 $id2");
 call($call);
 
+print STDERR ("\nPlease cite: Jühling, F., Kretzmer, H., Bernhart, S. H., Otto, C., Stadler, P. F., & Hoffmann, S. (2016). metilene: fast and sensitive calling of differentially methylated regions from bisulfite sequencing data. Genome research, 26(2), 256-262.\n");
+print $OUT_LOG ("\nPlease cite: Jühling, F., Kretzmer, H., Bernhart, S. H., Otto, C., Stadler, P. F., & Hoffmann, S. (2016). metilene: fast and sensitive calling of differentially methylated regions from bisulfite sequencing data. Genome research, 26(2), 256-262.\n");
+
 close ($OUT_LOG);
 
 # -----------------------------------------------------------------------------ls

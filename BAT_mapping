@@ -416,7 +416,13 @@ if (defined $make_tmp_flag){
     }
 }
 
+
+print STDERR ("\nPlease cite\n\tHoffmann, Steve, et al. \"Fast mapping of short sequences with mismatches, insertions and deletions using index structures.\" PLoS computational biology 5.9 (2009): e1000502.\n\tOtto, Christian, et al. \"Fast and sensitive mapping of bisulfite-treated sequencing data.\" Bioinformatics 28.13 (2012): 1698-1704.\n");
+print $OUT_LOG ("\nPlease cite\n\tHoffmann, Steve, et al. \"Fast mapping of short sequences with mismatches, insertions and deletions using index structures.\" PLoS computational biology 5.9 (2009): e1000502.\n\tOtto, Christian, et al. \"Fast and sensitive mapping of bisulfite-treated sequencing data.\" Bioinformatics 28.13 (2012): 1698-1704.\n");
+
+
 close ($OUT_LOG);
+
 
 # -----------------------------------------------------------------------------
 # FUNCTIONS
